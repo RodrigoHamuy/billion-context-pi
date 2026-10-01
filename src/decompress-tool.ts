@@ -44,9 +44,6 @@ export function makeDecompressTool(runtime: AcpRuntime, overrides?: ToolPromptOv
     // Guidelines lead with the tool name — see compress-tool.ts (#586).
     promptGuidelines: [
       "decompress: use when you need exact details lost in compression (file contents, error messages, signatures).",
-      "decompress: message ref (UUID) returns ONLY that one message's original text, default inline (small). Block id (b5) returns the whole block, default file.",
-      "decompress: pass inline:true ONLY when content is small or you accept the context cost (block mode).",
-      "decompress: use full:true to recurse through all nested tiers to original messages.",
     ],
     parameters: DecompressParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {

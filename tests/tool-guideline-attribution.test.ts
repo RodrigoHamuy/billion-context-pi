@@ -39,7 +39,8 @@ test("every built-in promptGuideline leads with its exact tool name", () => {
       checked += 1;
     }
   }
-  // Non-vacuity guard: the built-in default surface ships 24 attributed
-  // guidelines; deleting them all must fail, not silently pass.
-  assert.ok(checked >= 20, `expected >= 20 attributed built-in guidelines, got ${checked}`);
+  // Non-vacuity guard: the built-in default surface ships 16 attributed
+  // guidelines (#590 pruned 8 that merely restated the tool description or a
+  // param description); deleting them all must fail, not silently pass.
+  assert.ok(checked >= 12, `expected >= 12 attributed built-in guidelines, got ${checked}`);
 });

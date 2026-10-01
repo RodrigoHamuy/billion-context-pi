@@ -57,7 +57,6 @@ export function makeCompressTool(runtime: AcpRuntime, overrides?: ToolPromptOver
     // so unnamed bullets are indistinguishable across tools (#586).
     promptGuidelines: [
       "compress: each message has an acp tag with its mNNNNN ref, token size, and type. Compress ranges by their refs.",
-      "compress: batch multiple unrelated ranges in one call — each gets its own topic and summary.",
       "compress: write dense, self-contained summaries — preserve file paths, signatures, errors, and decisions verbatim.",
       "compress: never compress content the current step is actively using.",
     ],

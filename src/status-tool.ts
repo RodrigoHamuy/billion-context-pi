@@ -32,8 +32,6 @@ export function makeStatusTool(runtime: AcpRuntime, overrides?: ToolPromptOverri
     promptSnippet: 'acp_status({}) or acp_status({ scope: "uncompressed", view: "messages" })',
     promptGuidelines: [
       "acp_status: call with no args for a quick overview of context usage.",
-      "acp_status: use scope:'uncompressed' to find the largest compressible ranges.",
-      "acp_status: use scope:'compressed' to inspect existing compression blocks.",
     ],
     parameters: StatusParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {

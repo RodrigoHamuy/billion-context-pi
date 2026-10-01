@@ -72,7 +72,6 @@ export function makeCacheTool(runtime: AcpRuntime, overrides?: ToolPromptOverrid
     promptSnippet: "acp_cache({})",
     promptGuidelines: [
       "acp_cache: call when asked about cache hits, cache invalidation, or what compression costs.",
-      "acp_cache: read-only — reports numbers, never mutates context.",
     ],
     parameters: CacheParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {

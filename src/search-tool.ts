@@ -22,7 +22,6 @@ export function makeSearchTool(runtime: AcpRuntime, overrides?: ToolPromptOverri
             "Search compressed blocks AND historical messages by keyword. Use to cheaply locate detail before decompressing. Returns ranked results with ref, size, preview, and the decompress command to retrieve full content.",
         promptSnippet: 'search_context({ query: "auth token" })',
         promptGuidelines: [
-            "search_context: locate detail folded into summaries or past messages — cheaper than decompressing blind.",
             "search_context: each result shows a ref (b3 block / m00350 message), size, and the exact decompress command for full content.",
             "search_context: message hits link to the owning block — decompress that block to recover surrounding detail.",
         ],
