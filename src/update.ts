@@ -251,7 +251,7 @@ export function versionSatisfiesSpec(version: string, spec: string): boolean {
   const bpat = base.parts[2] ?? 0;
   if (bound === "major") return vmaj === bmaj;
   if (bound === "minor") return vmaj === bmaj && vmin === bmin;
-  return vpat === bpat;
+  return vmaj === bmaj && vmin === bmin && vpat === bpat;
 }
 
 function parseSemVer(version: string): { parts: number[]; pre: string[] } | undefined {

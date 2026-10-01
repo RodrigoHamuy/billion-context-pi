@@ -577,6 +577,9 @@ test("versionSatisfiesSpec judges range specs precisely (issue #584 range gate)"
   assert.equal(versionSatisfiesSpec("0.3.0", "^0.2.3"), false);
   assert.equal(versionSatisfiesSpec("0.0.3", "^0.0.3"), true);
   assert.equal(versionSatisfiesSpec("0.0.4", "^0.0.3"), false);
+  // ^0.0.x caps at patch level: same-patch releases in higher minors/majors are out
+  assert.equal(versionSatisfiesSpec("0.1.3", "^0.0.3"), false);
+  assert.equal(versionSatisfiesSpec("1.0.3", "^0.0.3"), false);
   // tilde: floor + minor cap
   assert.equal(versionSatisfiesSpec("1.2.9", "~1.2.3"), true);
   assert.equal(versionSatisfiesSpec("1.3.0", "~1.2.3"), false);
