@@ -89,10 +89,12 @@ export interface AcpRuntime {
    *  that cycles through many sessions doesn't accumulate them. */
   throttleDrop: (sid: string) => void;
   /** Per-session tokenCount scale tracker (estimate vs provider). Returns true
-   *  when the scale just flipped (stale↔not-stale) so the caller can reset the
-   *  growth baseline — a cross-scale delta is a false artifact, not real growth
-   *  (issue #267). The first observation for a session never reports a flip. */
-  noteTokenScale: (sid: string, stale: boolean) => boolean;
+   *  when the dominant ruler (hostFloor vs sentTokens) just switched by more
+   *  than the hysteresis dead-band, so the caller can reset the growth baseline
+   *  — a cross-scale delta is a false artifact, not real growth (issue #267).
+   *  Near-tied rulers jittering inside the band do NOT report a flip (#598).
+   *  The first observation for a session never reports a flip. */
+  noteTokenScale: (sid: string, hostFloor: number, sentTokens: number) => boolean;
   /** Drop a session's token-scale tracker (session_shutdown). */
   dropTokenScale: (sid: string) => void;
   store: SessionStateStore;
@@ -444,17 +446,41 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     throttleEpisodes.delete(sid);
   }
 
-  // Per-session tokenCount scale (estimate vs provider). When the anchor flips
-  // stale↔not-stale the meter switches rulers; a growth delta spanning that
-  // switch is a false artifact (issue #267), so the caller resets the baseline.
-  const tokenScaleStale = new Map<string, boolean>();
-  function noteTokenScale(sid: string, stale: boolean): boolean {
-    const prev = tokenScaleStale.get(sid);
-    tokenScaleStale.set(sid, stale);
-    return prev !== undefined && prev !== stale;
+  // Per-session tokenCount scale (estimate vs provider). The meter reports
+  // tokenCount as the max of two rulers — the provider floor (hostFloor) and
+  // the local sent-view estimate (sentTokens) — whichever is larger is the
+  // "dominant" ruler. When dominance genuinely switches, a growth delta
+  // spanning that switch is a false artifact (issue #267), so the caller
+  // resets the baseline.
+  //
+  // Hysteresis (issue #598): the raw `hostFloor <= sentTokens` comparison
+  // flip-flops turn-to-turn whenever the two rulers sit within jitter of each
+  // other (near-tied sessions), and every such micro-flip used to zero the
+  // growth baseline before it could accumulate to growthFloor — so growth
+  // nudges never fired until the pressure band. A flip now requires the
+  // challenging ruler to overtake the incumbent by more than a dead-band
+  // (relative, with an absolute floor matching the view-recount drift gate);
+  // inside the band the previous dominance sticks. A genuine switch (tens of
+  // % apart, or a predates adjustment) still exceeds the band and re-anchors.
+  const SCALE_FLIP_BAND_RATIO = 0.10;
+  const SCALE_FLIP_BAND_MIN = 1000;
+  type ScaleDominator = "est" | "host";
+  const tokenScaleDominant = new Map<string, ScaleDominator>();
+  function noteTokenScale(sid: string, hostFloor: number, sentTokens: number): boolean {
+    const prev = tokenScaleDominant.get(sid);
+    if (prev === undefined) {
+      tokenScaleDominant.set(sid, sentTokens >= hostFloor ? "est" : "host");
+      return false;
+    }
+    const band = Math.max(SCALE_FLIP_BAND_MIN, SCALE_FLIP_BAND_RATIO * Math.max(hostFloor, sentTokens));
+    let dom: ScaleDominator = prev;
+    if (prev === "est" && hostFloor - sentTokens > band) dom = "host";
+    else if (prev === "host" && sentTokens - hostFloor > band) dom = "est";
+    if (dom !== prev) tokenScaleDominant.set(sid, dom);
+    return dom !== prev;
   }
   function dropTokenScale(sid: string): void {
-    tokenScaleStale.delete(sid);
+    tokenScaleDominant.delete(sid);
   }
 
   // [#455] Per-session window of FRESH-anchor provider usage samples. The
