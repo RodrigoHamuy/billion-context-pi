@@ -184,6 +184,7 @@
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | 请求时丢弃历史 `compress` 调用上的超大思考（不修改持久化历史）。 |
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **可选开启**：wire 层剥离历史图像载荷（issue #321）。为 `true` 时，除最近 `stripImagesKeepRecent` 条消息外，历史消息的图像部分在上游请求体中被剥离；纯图像消息折叠为 `"[image]"` 文本占位符。支持协议：anthropic-messages、openai-completions、openai-responses（含 azure/codex 变体）。 |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | `stripImages` 开启时保留图像载荷的最近消息条数。 |
+| `compress.async` | boolean | `false` | 🟢 ACTIVE | **可选开启，实验性**：异步压缩（#614）。非紧急 nudge 交给刚发出的请求的同模型 fork 处理，主 agent 继续工作；校验通过的摘要在下一个请求边界生效。详见 [`compress.async`](#compressasync)。 |
 
 **prompts 键**
 
@@ -693,6 +694,30 @@
 - **默认：** `"default"`
 - **状态：** 🟢 ACTIVE
 - **描述：** 选择一个**提示词包（prompt pack）**——一组命名的表面覆盖（提示词分段、nudge 分段、工具提示词、delegate 提示词、四条压缩规则），作为 `acp.json` 内联覆盖之下的基础层生效。与其他 `compress.*` 字段走同一三级级联：`models > providers > global`，逐回合按当前模型解析。完整参考与内置 `lean` 包见[提示词包](#提示词包)。
+
+### `compress.async`
+
+- **类型：** `boolean`
+- **默认：** `false`
+- **状态：** 🟢 ACTIVE（实验性）
+- **描述：** 可选开启的异步压缩（[#614](https://github.com/ranxianglei/billion-context-pi/issues/614)）。与其他 `compress.*` 字段走同一 `models > providers > global` 三级级联；只有字面量 `true` 才开启（其他非布尔值记一条警告并保持关闭）。关闭（默认）时行为完全不变。
+
+  开启后，**非紧急** nudge 不再注入主请求，而是：
+
+  1. 主请求按无 nudge 的形态照常发出，主 agent 继续工作。
+  2. 主请求的响应开始后，ACP 通过同一 provider 适配器、同一模型、同一 API key/base URL 与请求头发出**一个** fork 请求：主请求的 provider 载荷（同一系统提示词、工具、历史与带签名的 reasoning 块）末尾追加一条与同步路径完全相同的 nudge 用户消息。其前缀就是刚发出的请求，因此命中提示词缓存。
+  3. 只使用 fork 的 `compress` 工具调用参数。fork 返回的任何内容都不会被执行——文本、reasoning 与其他工具调用一律丢弃。
+  4. 在下一个请求边界（下一个 `context` 事件，持有会话锁）对结果做校验：fork 看到的历史必须仍是当前视图的精确前缀、引用的 ref 必须绑定到同一消息、活跃 block 集合不变（例如期间没有落地其他 compress）。然后经过与 `compress` 工具相同的内核校验，**全有或全无**地应用。过期或无效的结果直接丢弃，实时状态不受影响。
+  5. 成功时先向会话日志追加一条只读的 `acp-async-compress` 记录，**然后**才采用新状态（记录写不进去则丢弃结果）。该记录保存已应用的 range，`.acp.json` sidecar 丢失时可按日志顺序与普通 compress 调用一起重放重建；若只是 sidecar 写入丢失（记录存在、已有 sidecar 缺该 block），下一次加载会基于当前视图重新应用该记录。block 摘要以稳定的 user 角色检查点出现在 block 位置（`[Compressed conversation section] … [ACP async compression: bN=mA–mB]`）；对 `bN` 的再折叠与 decompress 与普通 block 相同。
+
+  **仍走同步：** 紧急 nudge；nudge 不是请求最后一条消息时；fork 进行中时后续非紧急 nudge 暂缓。**适用范围：** 仅 Pi 宿主；协议 `anthropic-messages`、`openai-completions`、`openai-responses`；且无服务端会话状态（`previous_response_id` / `conversation` / `context_management`）。其他情况、fork 请求失败、fork 输出无效、5 分钟 fork 超时、或记录写入失败，都会让该会话回退到同步 nudge（每会话一条提示）。会话切换 / fork / 树导航 / 压缩（compaction）/ 切换模型 / 关闭，或用户中止主请求，都会中止进行中的 fork；关闭 `compress.async` 会丢弃待应用的结果。代理 / native 让位以及被拒绝的宿主上该功能不生效。
+
+  **限制：**
+  - fork 复用的是 **ACP 的 `before_provider_request` 处理器所看到的** provider 载荷。Pi 允许后加载的扩展*替换*该载荷，而这种替换对扩展不可见；存在此类扩展时，fork 读到的字节可能与主请求不同（缓存未命中，摘要可能涉及主 agent 未看到的内容）。后续 `before_provider_headers` 处理器原地修改的请求头*会*被包含。校验证明的是历史结构与 ref，而不是摘要忠实于 ACP 从未见过的字节。
+  - fork 的用量写入 ACP 日志（`event=fork-finished`，含 input / output / cacheRead / cacheWrite），但**不**计入 Pi 的会话费用统计。
+  - Anthropic：fork 保留主请求的缓存断点（因此前缀为缓存读取）；同步请求则会把该断点移到 nudge 上。
+  - 基于环境变量认证的 provider（Bedrock、Vertex）目前属于不支持的协议，保持同步。
+  - 若 fork 结果会对已内联还原的 block 做**原地**再折叠（同一 block id、新摘要），整批拒绝，下一次 nudge 走同步：内核在原地再折叠时保留 block 原来的 `compressCallId`，异步记录将无法再与其对应。记录恢复同样带此保护，绝不覆盖更新的 block。
 
 ### 软目标与弹性余量 (#1122)
 

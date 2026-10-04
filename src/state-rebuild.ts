@@ -1,8 +1,8 @@
-import type { CompressionCore, CompressionState } from "acp-kernel";
+import type { CompressionCore, CompressionState, CoreMessage } from "acp-kernel";
 import { estimateTokensFast } from "acp-kernel";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { logWarn } from "./log.js";
-import { entriesToCoreMessages } from "./messages.js";
+import { entriesToCoreMessages, ASYNC_COMPRESS_CUSTOM_TYPE, ASYNC_CALL_ID_PREFIX } from "./messages.js";
 import { sanitizeSummary } from "./summary-sanitize.js";
 
 /**
@@ -25,6 +25,9 @@ import { sanitizeSummary } from "./summary-sanitize.js";
 
 interface CompressCall {
   entryIndex: number;
+  /** Async records (#614) replay against the view BEFORE their custom entry;
+   *  compress calls replay through their own assistant entry. */
+  prefixEnd: number;
   toolCallId: string;
   ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string; summaryMaxChars?: number }>;
 }
@@ -59,9 +62,33 @@ function entryMessage(entry: SessionEntry): { role?: string; toolName?: string; 
   return (entry as { message?: { role?: string; toolName?: string; toolCallId?: string; isError?: boolean } }).message;
 }
 
-/** Cheap scan: does this log contain at least one non-error compress toolResult? */
+function asyncRecordOf(entry: SessionEntry, entryIndex: number): CompressCall | null {
+  if (entry.type !== "custom" || (entry as { customType?: string }).customType !== ASYNC_COMPRESS_CUSTOM_TYPE) return null;
+  const raw = (entry as { data?: unknown }).data;
+  if (typeof raw !== "object" || raw === null) return null;
+  const data = raw as { version?: unknown; callId?: unknown; ranges?: unknown };
+  if (data.version !== 1 || typeof data.callId !== "string" || !data.callId.startsWith(ASYNC_CALL_ID_PREFIX) || !Array.isArray(data.ranges) || data.ranges.length === 0) return null;
+  const ranges: CompressCall["ranges"] = [];
+  for (const r of data.ranges) {
+    if (typeof r !== "object" || r === null) return null;
+    const item = r as { startRef?: unknown; endRef?: unknown; summary?: unknown; topic?: unknown; summaryMaxChars?: unknown };
+    if (typeof item.startRef !== "string" || typeof item.endRef !== "string" || typeof item.summary !== "string") return null;
+    ranges.push({
+      startRef: item.startRef,
+      endRef: item.endRef,
+      summary: item.summary,
+      topic: typeof item.topic === "string" ? item.topic : undefined,
+      summaryMaxChars: typeof item.summaryMaxChars === "number" ? item.summaryMaxChars : undefined,
+    });
+  }
+  return { entryIndex, prefixEnd: entryIndex, toolCallId: data.callId, ranges };
+}
+
+/** Cheap scan: does this log contain at least one non-error compress toolResult
+ *  or async compression record (#614)? */
 export function hasCompressHistory(entries: SessionEntry[]): boolean {
   for (const entry of entries) {
+    if (entry.type === "custom" && asyncRecordOf(entry, 0) !== null) return true;
     const m = entryMessage(entry);
     if (!m || m.role !== "toolResult" || m.toolName !== "compress" || !m.toolCallId) continue;
     if (m.isError !== true) return true;
@@ -89,7 +116,7 @@ function parseCompressCall(toolCallId: string, arguments_: unknown, entryIndex: 
       summaryMaxChars,
     });
   }
-  return { entryIndex, toolCallId, ranges };
+  return { entryIndex, prefixEnd: entryIndex + 1, toolCallId, ranges };
 }
 
 /**
@@ -127,6 +154,13 @@ export function rebuildStateFromLog(input: {
       else logWarn("state-rebuild", { event: "unparseable-compress-call", toolCallId: call.id });
     }
   });
+  entries.forEach((entry, entryIndex) => {
+    if (entry.type !== "custom") return;
+    const record = asyncRecordOf(entry, entryIndex);
+    if (record) calls.push(record);
+    else if ((entry as { customType?: string }).customType === ASYNC_COMPRESS_CUSTOM_TYPE) logWarn("state-rebuild", { event: "unparseable-async-record", entryIndex });
+  });
+  calls.sort((a, b) => a.entryIndex - b.entryIndex);
   if (calls.length === 0) return { state: input.state, report: { blocks: input.state.blocks.length, callsApplied: 0, callsSkipped: 0, errors: [] } };
 
   let state = input.state;
@@ -140,7 +174,7 @@ export function rebuildStateFromLog(input: {
       // compress. Replay mirrors that: processTurn on the prefix up to and
       // including the assistant toolCall entry (the toolResult comes after,
       // exactly like the live path), then applyCompression on the turn output.
-      const messages = entriesToCoreMessages(entries.slice(0, call.entryIndex + 1)) as ApplyInput["messages"];
+      const messages = entriesToCoreMessages(entries.slice(0, call.prefixEnd)) as ApplyInput["messages"];
       const tokenCount = messages.reduce((sum, m) => sum + estimateTokensFast(String((m as { text?: unknown }).text ?? "")), 0);
       const turn = core.processTurn({ messages, state, config: input.config, tokenCount });
       state = turn.state;
@@ -163,6 +197,67 @@ export function rebuildStateFromLog(input: {
     }
     state = applied.state;
     report.callsApplied += 1;
+  }
+  report.blocks = state.blocks.length;
+  return { state, report };
+}
+
+/**
+ * #614 recovery for an async record whose sidecar save never landed (the
+ * record is appended before the save, so a failed save or a crash between the
+ * two leaves a record whose block the existing sidecar lacks; the empty-state
+ * rebuild above never runs for a non-empty sidecar). Pending = record callId
+ * absent from every block (blocks are never deleted). Re-applied against the
+ * CURRENT view and state exactly like the live apply; refs are never reused,
+ * so the record's refs still name the same messages. Each callId is attempted
+ * at most once per process (`attempted`), so an unappliable record cannot
+ * re-run every turn.
+ */
+export function recoverPendingAsyncRecords(input: {
+  entries: SessionEntry[];
+  view: CoreMessage[];
+  state: CompressionState;
+  config: ApplyInput["config"];
+  core: CompressionCore;
+  attempted: Set<string>;
+}): RebuildResult | null {
+  let callIds: Set<string> | undefined;
+  const pending: CompressCall[] = [];
+  input.entries.forEach((entry, entryIndex) => {
+    if (entry.type !== "custom" || (entry as { customType?: string }).customType !== ASYNC_COMPRESS_CUSTOM_TYPE) return;
+    const record = asyncRecordOf(entry, entryIndex);
+    if (!record || input.attempted.has(record.toolCallId)) return;
+    callIds ??= new Set(input.state.blocks.map((b) => b.compressCallId).filter((id): id is string => id !== undefined));
+    if (!callIds.has(record.toolCallId)) pending.push(record);
+  });
+  if (pending.length === 0) return null;
+  let state = input.state;
+  const report: RebuildReport = { blocks: 0, callsApplied: 0, callsSkipped: 0, errors: [] };
+  const tokenCount = input.view.reduce((sum, m) => sum + estimateTokensFast(String(m.text ?? "")), 0);
+  for (const call of pending) {
+    input.attempted.add(call.toolCallId);
+    try {
+      const turn = input.core.processTurn({ messages: input.view as ApplyInput["messages"], state: structuredClone(state), config: input.config, tokenCount });
+      const applied = input.core.applyCompression({
+        ranges: call.ranges.map((r) => ({ ...r, compressCallId: call.toolCallId })),
+        messages: turn.messages as ApplyInput["messages"],
+        state: turn.state,
+        config: input.config,
+      });
+      const result = applied.result as { blocksCreated?: number; errors?: string[] };
+      const refolded = applied.state.blocks.some((b) => turn.state.blocks.some((prev) => prev.blockId === b.blockId && prev.runId !== b.runId));
+      if ((result.errors?.length ?? 0) > 0 || (result.blocksCreated ?? 0) === 0 || refolded) {
+        report.callsSkipped += 1;
+        for (const err of result.errors ?? []) report.errors.push(err);
+        if (refolded) report.errors.push("in-place refold");
+        continue;
+      }
+      state = applied.state;
+      report.callsApplied += 1;
+    } catch (e) {
+      report.callsSkipped += 1;
+      report.errors.push(`throw: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   report.blocks = state.blocks.length;
   return { state, report };

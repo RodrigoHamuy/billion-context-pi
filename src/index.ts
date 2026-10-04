@@ -10,7 +10,7 @@ import { Box, Text, type KeyId } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import type { CoreMessage, NudgeDecision, CompressionBlock, Prompts } from "acp-kernel";
 import { renderNudgeText, resolvePrompts, defaultPrompts, viableRanges } from "acp-kernel";
-import { type AdapterConfig, resolveDelegate, resolveHostSession, DEFAULT_DELEGATE_POLICY } from "./config.js";
+import { type AdapterConfig, resolveCompress, resolveDelegate, resolveHostSession, DEFAULT_DELEGATE_POLICY } from "./config.js";
 import { createRuntime, isPiHost, retryBreakerKey, type AcpRuntime } from "./runtime.js";
 import { makeCompressTool, isCompressSuccessText, isCompressNoopText } from "./compress-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
@@ -22,7 +22,8 @@ import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, running
 import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
-import { coreOutToAgentMessages, extractText, ACP_NUDGE_CUSTOM_TYPE, type AcpNudgeRecord } from "./messages.js";
+import { coreOutToAgentMessages, extractText, ACP_NUDGE_CUSTOM_TYPE, ASYNC_COMPRESS_CUSTOM_TYPE, type AcpNudgeRecord } from "./messages.js";
+import { AsyncCompressor, ASYNC_SUPPORTED_APIS, applyReadyAsyncResult, asyncCarriers, asyncEnabledValue, takeSnapshot } from "./async-compress.js";
 import { liveOnlyTailCached, dropLiveOnlyTailCache } from "./live-only-tail.js";
 import { carryHostSystemMessages } from "./system-passthrough.js";
 import { sanitizeToolPairing } from "./tool-pair-sanitizer.js";
@@ -116,11 +117,13 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
       }
       return true;
     };
+    const asyncCompress = new AsyncCompressor({ pi });
     wireCompactionDisable(pi, runtime);
     wireDelegateReadTracking(pi);
     wireSessionLifecycle(pi, runtime, standDownIfProxied);
-    wireContextTransform(pi, runtime, standDownIfProxied);
-    wireBeforeProviderRequest(pi, runtime, standDownIfProxied);
+    wireAsyncCompress(pi, runtime, asyncCompress);
+    wireContextTransform(pi, runtime, standDownIfProxied, asyncCompress);
+    wireBeforeProviderRequest(pi, runtime, standDownIfProxied, asyncCompress);
     wireSystemPrompt(pi, runtime);
     wireToolGuardrails(pi, runtime);
     wireOverflowSelfHeal(pi, runtime);
@@ -383,30 +386,93 @@ let lastDegNoticeKey: string | null = null;
 // the HTTP call — the same wire point the billion-context proxy strips at. We
 // only touch the body when the policy is enabled AND something was actually
 // removed; returning undefined keeps pi's payload reference untouched.
-function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean): void {
+function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean, asyncCompress: AsyncCompressor): void {
   pi.on("before_provider_request", async (event, ctx) => {
     if (runtime.refused) return;
     if (standDownIfProxied(ctx)) return;
     const settings = runtime.stripImagesFor(ctx);
-    if (!settings.enabled) return;
-    const outcome = applyStripImages(event.payload, (ctx.model as { api?: string } | undefined)?.api, settings);
-    if (outcome.removed > 0) {
-      logInfo("strip-images", {
-        sid: ctx.sessionManager.getSessionId(),
-        event: "stripped",
-        removed: outcome.removed,
-        keepRecent: settings.keepRecent,
-      });
-      return outcome.body;
+    let body: unknown;
+    if (settings.enabled) {
+      const outcome = applyStripImages(event.payload, (ctx.model as { api?: string } | undefined)?.api, settings);
+      if (outcome.removed > 0) {
+        logInfo("strip-images", {
+          sid: ctx.sessionManager.getSessionId(),
+          event: "stripped",
+          removed: outcome.removed,
+          keepRecent: settings.keepRecent,
+        });
+        body = outcome.body;
+      }
     }
-    return;
+    // #614: the async fork reuses the payload as of this handler (after our
+    // own strip). Handlers loaded after this one may still replace it; that
+    // replacement is not observable here (documented limitation).
+    asyncCompress.onPayload(ctx.sessionManager.getSessionId(), body ?? event.payload, ctx);
+    return body;
   });
+}
+
+// #614 async compression lifecycle: header capture (mutated in place, so the
+// held reference is the final header set), launch after the main request's
+// response arrives, and cancellation on anything that invalidates the session
+// view the fork was built from.
+function wireAsyncCompress(pi: ExtensionAPI, runtime: AcpRuntime, asyncCompress: AsyncCompressor): void {
+  pi.on("session_start", (_event, ctx) => {
+    asyncCompress.resetSession(ctx.sessionManager.getSessionId());
+  });
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (runtime.refused) return;
+    asyncCompress.onHeaders(ctx.sessionManager.getSessionId(), event.headers);
+  });
+  pi.on("after_provider_response", (event, ctx) => {
+    if (runtime.refused) return;
+    asyncCompress.onResponse(ctx.sessionManager.getSessionId(), event.status, ctx);
+  });
+  pi.on("message_end", (event, ctx) => {
+    const msg = event.message;
+    if (msg.role !== "assistant" || (msg.stopReason !== "error" && msg.stopReason !== "aborted")) return;
+    asyncCompress.onMainFailed(ctx.sessionManager.getSessionId(), `main-${msg.stopReason}`, msg.stopReason === "aborted");
+  });
+  pi.on("agent_end", (_event, ctx) => {
+    asyncCompress.onMainFailed(ctx.sessionManager.getSessionId(), "agent-end-before-launch");
+  });
+  pi.on("session_before_switch", (_event, ctx) => { asyncCompress.cancel(ctx.sessionManager.getSessionId(), "session-switch"); });
+  pi.on("session_before_fork", (_event, ctx) => { asyncCompress.cancel(ctx.sessionManager.getSessionId(), "session-fork"); });
+  pi.on("session_before_tree", (_event, ctx) => { asyncCompress.cancel(ctx.sessionManager.getSessionId(), "session-tree"); });
+  pi.on("model_select", (_event, ctx) => { asyncCompress.cancel(ctx.sessionManager.getSessionId(), "model-select"); });
+  pi.on("session_before_compact", (_event, ctx) => { asyncCompress.cancel(ctx.sessionManager.getSessionId(), "session-compact"); });
+  pi.on("session_shutdown", (_event, ctx) => { asyncCompress.resetSession(ctx.sessionManager.getSessionId()); });
+}
+
+let asyncValueWarned = false;
+
+function asyncConfigured(runtime: AcpRuntime, ctx: ExtensionContext): boolean {
+  const m = ctx.model as { provider?: string; id?: string } | undefined;
+  return asyncEnabledValue(resolveCompress(runtime.adapter.compress, m?.provider, m?.id).async, (v) => {
+    if (asyncValueWarned) return;
+    asyncValueWarned = true;
+    logWarn("config", { event: "compress-async-invalid", value: JSON.stringify(v), fallback: false });
+  });
+}
+
+function asyncCompressEligible(runtime: AcpRuntime, asyncCompress: AsyncCompressor, ctx: ExtensionContext, sid: string): boolean {
+  const m = ctx.model as { api?: string } | undefined;
+  if (!asyncConfigured(runtime, ctx) || asyncCompress.fallbackReason(sid) !== undefined) return false;
+  if (!isPiHost(ctx.sessionManager) || !ctx.model || typeof ctx.modelRegistry?.getProvider !== "function") {
+    asyncCompress.markFallback(sid, "unsupported-host", ctx);
+    return false;
+  }
+  if (!ASYNC_SUPPORTED_APIS.has(String(m?.api))) {
+    asyncCompress.markFallback(sid, `unsupported-api:${m?.api ?? "unknown"}`, ctx);
+    return false;
+  }
+  return true;
 }
 
 // The core integration: Pi's `context` event fires before every LLM call with the
 // messages about to be sent. We run acp-kernel's processTurn (prune + ref-tag +
 // nudge decision) and return the transformed AgentMessage[].
-function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean): void {
+function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean, asyncCompress: AsyncCompressor): void {
   pi.on("context", async (event, ctx) => {
     // Refused host (OMP / proxied baseUrl): leave the context completely
     // untouched — no ref tags, no compression, no nudge. Returning undefined
@@ -420,8 +486,11 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     try {
       await runtime.reloadConfig(ctx.cwd);
       const modelId = (ctx.model as { id?: string } | undefined)?.id ?? "default";
-      const { state, coreMessages, entries } = await runtime.stateFor(ctx, event.messages);
+      const loaded = await runtime.stateFor(ctx, event.messages);
+      const { coreMessages, entries } = loaded;
       const configBase = runtime.configFor(ctx);
+      const asyncApplied = await applyReadyAsyncResult({ compressor: asyncCompress, pi, ctx, core: runtime.core, config: configBase, view: coreMessages, state: loaded.state, entries, save: (next) => runtime.save(next, ctx), enabled: asyncConfigured(runtime, ctx) });
+      const state = asyncApplied?.state ?? loaded.state;
       const ov = runtime.overflowFor(sid);
       // Self-heal: a prior upstream overflow may have taught us the real window
       // (see overflow-selfheal). If it is smaller than what we resolved this
@@ -477,7 +546,9 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // it (issue #325, floor-stale.ts) instead of skipping the floor entirely —
       // the skip dropped the meter onto the undercounting estimate (~70-80K low)
       // and the next fresh reading snapped it back into the emergency band.
-      const { predates, netReclaimed, fresh, lastRealTokens } = compressionAnchorStaleness(entries, state.blocks, defaultCountTokens);
+      // #614: the async record was appended this event, after `entries` was read.
+      const anchorEntries = asyncApplied ? [...entries, { type: "custom", customType: ASYNC_COMPRESS_CUSTOM_TYPE, data: asyncApplied.record }] : entries;
+      const { predates, netReclaimed, fresh, lastRealTokens } = compressionAnchorStaleness(anchorEntries, state.blocks, defaultCountTokens);
       // issue #600: when the previous model turn yielded no fresh provider usage
       // (errored / aborted / zero-usage — e.g. a network "fetch failed"), the host's
       // getContextUsage() has no anchor and reports the raw session-tree total
@@ -708,7 +779,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     });
 
     const originalById = collectOriginals(entries);
-    let rebuilt = coreOutToAgentMessages(turn.messages, originalById);
+    let rebuilt = coreOutToAgentMessages(turn.messages, originalById, asyncCarriers(turn.state));
     // [#336] Request-time reasoning drop, aligned with opencode-acp #377:
     // compress calls are hard-exempt from compression, so their thinking
     // rides along every request as an unreclaimable floor. Round closure is
@@ -811,6 +882,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       runtime.markNudgeShown(sid, turnKey, tokenCount);
     }
 
+    let asyncHandoff: { message: AgentMessage; text: string } | null = null;
     if (turn.nudge?.shouldInject) {
       // Two independent channels for the nudge:
       //  1. CONTEXT injection (always on): the nudge is appended to the
@@ -848,9 +920,14 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // kernel's emergency truncation still shrinks context mechanically.
       const retryCapped = runtime.compressRetryCappedFor(sid, retryTurnKey);
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
-      const alreadyShown = retryCapped || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady);
+      // #614: a pre-launch async drop hands its nudge back to the sync path once.
+      const syncRetry = !emergency && asyncCompress.takeSyncRetry(sid);
+      const asyncOn = !emergency && !syncRetry && asyncCompressEligible(runtime, asyncCompress, ctx, sid);
+      const alreadyShown = retryCapped || (asyncOn && asyncCompress.isActive(sid)) || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady && !syncRetry);
       if (!alreadyShown) {
-        rebuilt.push(nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx)));
+        const injected = nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx));
+        rebuilt.push(injected);
+        if (asyncOn) asyncHandoff = { message: injected, text: extractText((injected as { content?: unknown }).content) };
         const rendered = renderNudgeText(turn.nudge, runtime.prompts, activeNudgeSections(runtime, ctx));
         const top = [...turn.nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
         const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}", summary: "..." }] })` : "";
@@ -919,6 +996,18 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       if (sanitized.droppedResults.length > 0) {
         rebuilt = sanitized.messages;
         logWarn("tool-pair-sanitize", { sid, event: "dropped-orphan-results", count: sanitized.droppedResults.length, droppedResults: sanitized.droppedResults });
+      }
+    }
+
+    // #614 handoff: the fork's prompt is this exact view plus the nudge appended
+    // last, so only hand off when the nudge IS the final message (otherwise the
+    // fork would see a different order than the sync path) — else stay sync.
+    if (asyncHandoff) {
+      if (rebuilt[rebuilt.length - 1] === asyncHandoff.message && ctx.model) {
+        rebuilt = rebuilt.slice(0, -1);
+        asyncCompress.start(sid, { nudgeText: asyncHandoff.text, snapshot: takeSnapshot(coreMessages, turn.state), model: ctx.model });
+      } else {
+        logInfo("async-compress", { sid, event: "handoff-skipped", reason: "nudge-not-final" });
       }
     }
 
@@ -1195,13 +1284,15 @@ function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts:
 // rebuild, so this is required for the records to be visible at all.
 function wireNudgeRecords(pi: ExtensionAPI): void {
   if (typeof pi.registerEntryRenderer !== "function") return;
-  pi.registerEntryRenderer<AcpNudgeRecord>(ACP_NUDGE_CUSTOM_TYPE, (entry, _options, theme) => {
-    const text = entry.data?.text;
-    if (!text) return undefined;
-    const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
-    box.addChild(new Text(theme.fg("dim", text), 0, 0));
-    return box;
-  });
+  for (const customType of [ACP_NUDGE_CUSTOM_TYPE, ASYNC_COMPRESS_CUSTOM_TYPE]) {
+    pi.registerEntryRenderer<AcpNudgeRecord>(customType, (entry, _options, theme) => {
+      const text = entry.data?.text;
+      if (!text) return undefined;
+      const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+      box.addChild(new Text(theme.fg("dim", text), 0, 0));
+      return box;
+    });
+  }
 }
 
 // Compact one-line twin of nudgeMessage() for the persisted session entry

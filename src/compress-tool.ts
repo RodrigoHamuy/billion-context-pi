@@ -413,7 +413,7 @@ function cappedRejectionText(snapshot: string): string {
   ].join("\n");
 }
 
-function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionBlock[]): string[] | null {
+export function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionBlock[]): string[] | null {
   if (newBlocks.length === 0) return null;
   const byId = new Map(allBlocks.map((b) => [b.blockId, b]));
   const spans: string[] = [];

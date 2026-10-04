@@ -185,6 +185,7 @@ All keys below are currently **ACTIVE**.
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | Drop oversized thinking from historical `compress` calls (request-time; persisted history untouched). |
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **Opt-in** wire-level strip of historical image payloads (issue #321). When `true`, every message older than the most recent `stripImagesKeepRecent` has its image parts dropped from the outbound provider body; image-only messages collapse to a `"[image]"` text placeholder. Supported wire dialects: anthropic-messages, openai-completions, openai-responses (incl. azure/codex variants). |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | How many of the most recent messages keep their image payloads when `stripImages` is on. |
+| `compress.async` | boolean | `false` | 🟢 ACTIVE | **Opt-in, experimental** async compression (#614). A non-emergency nudge is answered by a same-model fork of the request that was just sent while the main agent continues; the validated summary is applied at the next request boundary. See [`compress.async`](#compressasync). |
 
 **Prompts keys**
 
@@ -697,6 +698,30 @@ The flow is:
 - **Default:** `"default"`
 - **Status:** 🟢 ACTIVE
 - **Description:** Selects a **prompt pack** — a named bundle of surface overrides (prompt sections, nudge sections, tool prompts, delegate prompt, compression rules) applied as the base layer under your inline `acp.json` overrides. Resolved through the same three-level cascade as every other `compress.*` field: `models > providers > global`, per active model, per turn. See [Prompt Packs](#prompt-packs) for the full reference and the built-in `lean` pack.
+
+### `compress.async`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** 🟢 ACTIVE (experimental)
+- **Description:** Opt-in async compression ([#614](https://github.com/ranxianglei/billion-context-pi/issues/614)). Resolved through the same `models > providers > global` cascade as every other `compress.*` field; only the literal `true` enables it (any other non-boolean value logs a warning and stays off). With it off (the default) nothing changes.
+
+  When on, a **non-emergency** nudge is not injected into the main request. Instead:
+
+  1. The main request goes out exactly as it would without the nudge, and the main agent keeps working.
+  2. When the main request's response starts, ACP sends **one** fork request through the same provider adapter, model, API key/base URL and request headers: the main request's provider payload (same system prompt, tools, history and signed reasoning blocks) with the exact sync nudge appended as one final user turn. Its prefix is the request that was just sent, so it reads from the prompt cache.
+  3. Only the fork's `compress` tool-call arguments are used. Nothing the fork returns is executed — text, reasoning and any other tool calls are discarded.
+  4. At the next request boundary (the next `context` event, under the session lock) the result is validated against the current session: the history the fork saw must still be an exact prefix of the current view, the cited refs must bind to the same messages, and the active block set must be unchanged (e.g. no compress landed meanwhile). It then passes the same kernel validation as the `compress` tool and applies **all-or-nothing**. A stale or invalid result is discarded and the live state is untouched.
+  5. On success a display-only `acp-async-compress` entry is appended to the session log **before** the new state is adopted (if it cannot be written the result is discarded). It records the applied ranges so a lost `.acp.json` sidecar can be rebuilt from the log, in log order with ordinary compress calls; if only the sidecar write was lost (record present, block missing from an existing sidecar), the next load re-applies the record against the current view. The block's summary reaches the model as a stable user-role checkpoint at the block's position (`[Compressed conversation section] … [ACP async compression: bN=mA–mB]`); refolding or decompressing `bN` works as for any block.
+
+  **Stays synchronous:** emergency nudges; a nudge that is not the last message of the request; while a fork is in flight, further non-emergency nudges are held back. **Scope:** Pi host only, wires `anthropic-messages`, `openai-completions`, `openai-responses`, and no server-side conversation state (`previous_response_id` / `conversation` / `context_management`). Anything else, a failed fork request, invalid fork output, the 5-minute fork timeout, or a failed record write switches the session back to synchronous nudges (one notice per session). Session switch / fork / tree navigation / compaction / model change / shutdown, or a user abort of the main request, abort an in-flight fork; turning `compress.async` off discards any pending result. Under the proxy / native stand-down and on refused hosts the feature is inert.
+
+  **Limitations:**
+  - The fork reuses the provider payload **as seen by ACP's `before_provider_request` handler**. Pi lets later-loaded extensions *replace* that payload, and the replacement is not observable from an extension; with such an extension the fork can read different bytes than the main request (cache miss, and a summary of content the main agent did not see). Header changes made in place by later `before_provider_headers` handlers *are* included. Validation proves the history structure and refs, not that the summary is faithful to bytes ACP never saw.
+  - Fork usage is written to the ACP log (`event=fork-finished` with input / output / cacheRead / cacheWrite) but is **not** counted in Pi's session cost totals.
+  - Anthropic: the fork keeps the main request's cache breakpoint (so its prefix is a cache read); the sync request would have moved that breakpoint onto the nudge.
+  - Providers with environment-based auth flows (Bedrock, Vertex) are unsupported wires today and stay synchronous.
+  - A fork result that would refold an inline-restored block **in place** (same block id, new summary) is rejected as a whole and the next nudge goes synchronous: the kernel keeps the block's original `compressCallId` on such a refold, so the async record could not be matched to it again. Record recovery applies the same guard and never overwrites a newer block.
 
 ### Soft target with elastic headroom (#1122)
 
