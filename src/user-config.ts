@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { acpJsonFiles } from "./config-dir.js";
 import type { Prompts } from "acp-kernel";
-import type { AdapterConfig, CompressConfig, DelegateConfig, HostSessionConfig, RepetitionGuardConfig } from "./config.js";
+import type { AdapterConfig, CompressConfig, HostSessionConfig, RepetitionGuardConfig } from "./config.js";
 import type { PiPromptSections } from "./system-prompt.js";
 import type { NudgeSectionsConfig, ToolPromptsConfig } from "./surface.js";
 import type { DegenerationGuardConfig } from "./degeneration.js";
@@ -22,19 +22,16 @@ export interface UserAcpConfig {
   preserveRecentTools?: string[];
   toolBashDefaultTimeout?: number;
   toolOutputMaxBytes?: number;
-  delegate?: boolean | DelegateConfig;
   compress?: CompressConfig;
   outputHeadroomMaxPct?: number | string;
   throttleRetry?: boolean | ThrottleRetryConfig;
   repetitionGuard?: boolean | RepetitionGuardConfig;
   degenerationGuard?: boolean | DegenerationGuardConfig;
-  displayUsage?: "merged" | "separate";
   prompts?: Partial<Prompts>;
   acknowledgePromptsRisk?: boolean;
   promptSections?: PiPromptSections;
   nudgeSections?: NudgeSectionsConfig;
   toolPrompts?: ToolPromptsConfig;
-  delegatePrompt?: string | null;
   hostSession?: boolean | HostSessionConfig;
   rules?: boolean;
 }
@@ -132,11 +129,11 @@ const KNOWN = new Set([
   "enabled", "debug", "autoUpdate", "modelContextLimit",
   "protectedTools", "protectedLatestTools", "neverPreserveRecentTools", "preserveRecentTools",
   "toolBashDefaultTimeout", "toolOutputMaxBytes",
-  "delegate", "compress", "displayUsage", "throttleRetry",
+  "compress", "throttleRetry",
   "outputHeadroomMaxPct",
   "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
-  "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
+  "promptSections", "nudgeSections", "toolPrompts",
   "hostSession", "rules",
 ]);
 

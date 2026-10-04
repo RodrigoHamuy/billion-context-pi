@@ -104,7 +104,6 @@ export type PiToolExtrasConfig = Partial<Record<AcpToolName, PiToolExtras>>;
 export interface PiAdapterSurface {
   promptSections: Partial<PiPromptSections>;
   toolExtras: PiToolExtrasConfig;
-  delegatePrompt?: string | null;
 }
 
 /**
@@ -136,9 +135,6 @@ export function piAdapterSurface(pack: Pack): PiAdapterSurface {
     promptSections: sanitizePromptSections(rec.promptSections),
     toolExtras,
   };
-  if (typeof rec.delegatePrompt === "string" || rec.delegatePrompt === null) {
-    surface.delegatePrompt = rec.delegatePrompt;
-  }
   return surface;
 }
 
@@ -187,7 +183,6 @@ export interface InlineSurface {
   promptSections?: Partial<PiPromptSections>;
   nudgeSections?: NudgeSectionsConfig;
   toolPrompts?: ToolPromptsConfig;
-  delegatePrompt?: string | null;
 }
 
 export interface MergedSurface {
@@ -195,7 +190,6 @@ export interface MergedSurface {
   promptSections: Partial<PiPromptSections>;
   nudgeSections: NudgeSectionsConfig;
   toolPrompts: ToolPromptsConfig;
-  delegatePrompt?: string | null;
 }
 
 export function mergeSurface(pack: Pack | null, inline: InlineSurface): MergedSurface {
@@ -206,7 +200,6 @@ export function mergeSurface(pack: Pack | null, inline: InlineSurface): MergedSu
     promptSections: { ...pi.promptSections, ...(inline.promptSections ?? {}) },
     nudgeSections: { ...(s.nudgeSections ?? {}), ...(inline.nudgeSections ?? {}) },
     toolPrompts: mergeToolPrompts(packToolPrompts(pack), inline.toolPrompts),
-    delegatePrompt: inline.delegatePrompt !== undefined ? inline.delegatePrompt : pi.delegatePrompt,
   };
 }
 
