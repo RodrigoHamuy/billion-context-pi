@@ -184,7 +184,7 @@ test("staleness: sums multiple post-anchor blocks", () => {
 // issue #595: expose the provider-usage anchor total and an upper bound
 // (trustedCeiling) on the true request size, so the caller can cap the host
 // floor when getContextUsage() falls back to a full-history estimate.
-test("staleness: anchorTotal = last valid usage; trustedCeiling = anchor + trailing", () => {
+test("staleness: lastRealTokens = last valid usage; trustedCeiling = anchor + trailing", () => {
   const entries = [
     msg("e0", { role: "user", content: "go" }),
     assistantUsage("e1"), // anchor: 175_000
@@ -192,7 +192,7 @@ test("staleness: anchorTotal = last valid usage; trustedCeiling = anchor + trail
     msg("e3", { role: "assistant", content: "", stopReason: "error" }), // failed → not an anchor
   ];
   const r = compressionAnchorStaleness(entries, [], ct);
-  assert.equal(r.anchorTotal, 175_000);
+  assert.equal(r.lastRealTokens, 175_000);
   assert.equal(r.trustedCeiling, 175_004); // 175_000 + len("abcd"); failed assistant adds 0
   assert.equal(r.predates, false);
 });
@@ -204,16 +204,61 @@ test("staleness: a failed assistant carrying a huge usage is not the anchor (#59
     msg("e2", { role: "assistant", content: "", stopReason: "error", usage: { totalTokens: 326_774 } }),
   ];
   const r = compressionAnchorStaleness(entries, [], ct);
-  assert.equal(r.anchorTotal, 175_000); // not the bogus 326_774
+  assert.equal(r.lastRealTokens, 175_000); // not the bogus 326_774
   assert.equal(r.trustedCeiling, 175_000);
 });
 
-test("staleness: no valid anchor → anchorTotal 0 and trustedCeiling 0 (caller keeps prior behavior)", () => {
+test("staleness: no valid anchor → lastRealTokens 0 and trustedCeiling 0 (caller keeps prior behavior)", () => {
   const entries = [
     msg("e0", { role: "user", content: "go" }),
     msg("e1", { role: "assistant", content: "hi", stopReason: "error" }),
   ];
   const r = compressionAnchorStaleness(entries, [], ct);
-  assert.equal(r.anchorTotal, 0);
+  assert.equal(r.lastRealTokens, 0);
   assert.equal(r.trustedCeiling, 0);
+});
+
+test("freshness: latest assistant with usage → fresh, lastRealTokens = that usage", () => {
+  const entries = [msg("e0", { role: "user", content: "go" }), assistantUsage("e1")];
+  const r = compressionAnchorStaleness(entries, [], ct);
+  assert.equal(r.fresh, true);
+  assert.equal(r.lastRealTokens, 175_000);
+});
+
+test("freshness: errored latest assistant → not fresh, lastRealTokens = prior anchor", () => {
+  const entries = [
+    msg("e0", { role: "user", content: "go" }),
+    assistantUsage("e1"),
+    msg("e2", { role: "assistant", content: "err", stopReason: "error" }),
+  ];
+  const r = compressionAnchorStaleness(entries, [], ct);
+  assert.equal(r.fresh, false);
+  assert.equal(r.lastRealTokens, 175_000);
+});
+
+test("freshness: aborted latest assistant → not fresh", () => {
+  const entries = [
+    msg("e0", { role: "user", content: "go" }),
+    assistantUsage("e1"),
+    msg("e2", { role: "assistant", content: "ab", stopReason: "aborted", usage: USAGE }),
+  ];
+  const r = compressionAnchorStaleness(entries, [], ct);
+  assert.equal(r.fresh, false);
+});
+
+test("freshness: zero-usage latest assistant → not fresh", () => {
+  const entries = [
+    msg("e0", { role: "user", content: "go" }),
+    assistantUsage("e1"),
+    msg("e2", { role: "assistant", content: "z", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ];
+  const r = compressionAnchorStaleness(entries, [], ct);
+  assert.equal(r.fresh, false);
+});
+
+test("freshness: no valid anchor anywhere → not fresh, lastRealTokens 0", () => {
+  const entries = [msg("e0", { role: "user", content: "go" }), msg("e1", { role: "assistant", content: "err", stopReason: "error" })];
+  const r = compressionAnchorStaleness(entries, [], ct);
+  assert.equal(r.fresh, false);
+  assert.equal(r.lastRealTokens, 0);
 });

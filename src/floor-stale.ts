@@ -35,25 +35,35 @@ function validAnchorUsage(u: UsageLike): boolean {
   return usageTotal(u) > 0;
 }
 
-function anchorUsageTotal(entry: AnchorEntry): number {
-  return usageTotal(entry.message?.usage);
+// Fresh provider-usage anchor; when the latest assistant turn is not one of
+// these (errored/aborted/zero-usage), the host reports raw session-tree total (#600).
+function isFreshAnchor(m: NonNullable<AnchorEntry["message"]>): boolean {
+  return m.role === "assistant" && m.stopReason !== "aborted" && m.stopReason !== "error" && validAnchorUsage(m.usage);
 }
 
 interface AnchorScan {
   lastUsageIdx: number;
   lastCompressIdx: number;
   compressIdxByCallId: Map<string, number>;
+  lastAssistantIdx: number;
+  lastUsageTotal: number;
 }
 
 function scanEntries(entries: AnchorEntry[]): AnchorScan {
   let lastUsageIdx = -1;
   let lastCompressIdx = -1;
+  let lastAssistantIdx = -1;
+  let lastUsageTotal = 0;
   const compressIdxByCallId = new Map<string, number>();
   for (let i = 0; i < entries.length; i++) {
     const m = entries[i]!.message;
     if (!m) continue;
-    if (m.role === "assistant" && m.stopReason !== "aborted" && m.stopReason !== "error" && validAnchorUsage(m.usage)) {
-      lastUsageIdx = i;
+    if (m.role === "assistant") {
+      lastAssistantIdx = i;
+      if (isFreshAnchor(m)) {
+        lastUsageIdx = i;
+        lastUsageTotal = usageTotal(m.usage);
+      }
     } else if (
       m.role === "toolResult" &&
       m.toolName === "compress" &&
@@ -65,7 +75,7 @@ function scanEntries(entries: AnchorEntry[]): AnchorScan {
       compressIdxByCallId.set(m.toolCallId, i);
     }
   }
-  return { lastUsageIdx, lastCompressIdx, compressIdxByCallId };
+  return { lastUsageIdx, lastCompressIdx, compressIdxByCallId, lastAssistantIdx, lastUsageTotal };
 }
 
 /** True when the last valid assistant usage anchor comes strictly BEFORE the
@@ -83,11 +93,14 @@ export interface AnchorStaleness {
   // Σ max(0, compressedTokens − summary) over active blocks whose compress
   // landed after the anchor; unattributable/pre-anchor blocks are excluded
   netReclaimed: number;
-  // totalTokens of the last valid provider-usage anchor (0 when none exists)
-  anchorTotal: number;
-  // Upper bound on the true current request size derivable WITHOUT trusting
-  // getContextUsage(): the measured anchor plus everything appended after it.
-  // 0 when there is no anchor to bound from (caller keeps prior behavior).
+  // #600: false when the latest assistant turn carried no valid provider usage
+  // (errored/aborted/zero) — the host then reports raw session-tree total.
+  fresh: boolean;
+  // total tokens of the last valid usage anchor (0 if none); the real floor base
+  lastRealTokens: number;
+  // issue #595: upper bound on the true current request size derivable WITHOUT
+  // trusting getContextUsage(): the measured anchor plus everything appended
+  // after it. 0 when there is no anchor to bound from (caller keeps prior behavior).
   trustedCeiling: number;
 }
 
@@ -115,16 +128,18 @@ export function compressionAnchorStaleness(
   // than the compressed send view. The measured anchor plus everything appended
   // after it is an upper bound on the true request size; expose it so callers can
   // cap the floor there instead of trusting the fallback estimate.
-  const anchorTotal = scan.lastUsageIdx >= 0 ? anchorUsageTotal(entries[scan.lastUsageIdx]!) : 0;
   let trailingEstimate = 0;
   for (let i = scan.lastUsageIdx + 1; i < entries.length; i++) {
     const m = entries[i]!.message;
     if (m && m.content != null) trailingEstimate += countTokens(extractText(m.content));
   }
+  const lastAssistant = scan.lastAssistantIdx >= 0 ? entries[scan.lastAssistantIdx] : undefined;
+  const fresh = !!lastAssistant?.message && isFreshAnchor(lastAssistant.message);
   return {
     predates: scan.lastCompressIdx > scan.lastUsageIdx,
     netReclaimed,
-    anchorTotal,
-    trustedCeiling: anchorTotal > 0 ? anchorTotal + trailingEstimate : 0,
+    fresh,
+    lastRealTokens: scan.lastUsageTotal,
+    trustedCeiling: scan.lastUsageTotal > 0 ? scan.lastUsageTotal + trailingEstimate : 0,
   };
 }

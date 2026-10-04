@@ -118,3 +118,50 @@ test("issue #595: retry fallback estimate must not floor the compressed view int
     await rm(LOG_FILE, { force: true });
   }
 });
+
+// #601 union: the cap must also bind on FRESH turns — the #595 trace where the
+// retry SUCCEEDS and carries usage (fresh anchor), yet the host's
+// estimateProjectedContextTokens() still reports the full-history fallback
+// because the retry's context_edit invalidated its anchor chain. The
+// freshness guard (#601) cannot reject this reading (the anchor is fresh);
+// only the trusted ceiling caps it.
+test("issue #595 (fresh anchor): fallback estimate capped even when the retry succeeded", async () => {
+  process.env.ACP_LOG_FILE = LOG_FILE;
+  await rm(`${STATE_FILE}.acp.json`, { force: true });
+  await rm(LOG_FILE, { force: true });
+  try {
+    const bulkIds = Array.from({ length: 19 }, (_, i) => `e${i}`);
+    await seedState(`${STATE_FILE}.acp.json`, {
+      blockId: "b0", runId: 0, tier: 1, generation: "young", active: true,
+      summary: "compressed early history", directMessageIds: bulkIds, effectiveMessageIds: bulkIds,
+      directBlockIds: [], compressedTokens: 100_000, survivedCount: 3, createdAt: Date.now(), compressCallId: "c-none",
+    });
+
+    const { api, handlers } = captureApi();
+    createAcpExtension({ modelContextLimit: 180_000 })(api as any);
+
+    // e19 anchors at 78_173; the retry (e22) SUCCEEDS and carries usage —
+    // fresh anchor — but the host still reports the abandoned-anchor fallback.
+    const entries = [
+      ...bulkEntries(),
+      msg("e19", "assistant", "ok", { usage: { input: 3_631, output: 942, cacheRead: 73_600, cacheWrite: 0 } }),
+      msg("e20", "toolResult", "x", { toolName: "read", toolCallId: "r1" }),
+      msg("e21", "assistant", "", { stopReason: "error" }),
+      msg("e22", "assistant", "retried ok", { usage: { input: 3_631, output: 942, cacheRead: 73_600, cacheWrite: 0 } }),
+    ];
+    branchEntries = entries;
+    await fire(handlers, entries, fakeCtx(326_774));
+
+    const turn = await lastTurnLog();
+    assert.ok(turn, "[turn] log line present");
+    assert.ok(turn!.tokens < 120_000, `fresh-anchor reading capped at the ceiling, not the fallback estimate (got ${turn!.tokens})`);
+    assert.notEqual(turn!.nudge, "emergency", `no false emergency (got ${turn!.nudge} @ ${turn!.tokens})`);
+    const log = await readFile(LOG_FILE, "utf-8");
+    assert.ok(log.includes("host-floor-capped"), "the cap event attributes the correction");
+    assert.ok(!log.includes("host-tree-sum-rejected"), "fresh anchor must not be treated as a tree-sum (#601 path inactive here)");
+  } finally {
+    delete process.env.ACP_LOG_FILE;
+    await rm(`${STATE_FILE}.acp.json`, { force: true });
+    await rm(LOG_FILE, { force: true });
+  }
+});
