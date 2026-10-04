@@ -180,12 +180,8 @@ export interface CompressSettings {
   /** How many of the MOST RECENT messages keep their image payloads when
    *  `stripImages` is enabled. Default: 5. Ignored when stripImages is off. */
   stripImagesKeepRecent?: number;
-  /** Opt-in async compression (#614). Default: false. When true, a non-emergency
-   *  nudge is answered by a same-model fork of the request that was just
-   *  sent (same history, system prompt and tools) while the main agent
-   *  continues without the nudge; the fork's validated `compress` result is
-   *  applied at the next request boundary. Emergency nudges stay synchronous.
-   *  Only the literal boolean true enables it. */
+  /** Opt-in (#614). Default: false. When true, non-emergency nudges are answered
+   *  by a same-model fork in the background; emergency nudges stay synchronous. */
   async?: boolean;
 }
 

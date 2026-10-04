@@ -404,18 +404,13 @@ function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standD
         body = outcome.body;
       }
     }
-    // #614: the async fork reuses the payload as of this handler (after our
-    // own strip). Handlers loaded after this one may still replace it; that
-    // replacement is not observable here (documented limitation).
+    // Replacements by handlers loaded after this one are not observable here.
     asyncCompress.onPayload(ctx.sessionManager.getSessionId(), body ?? event.payload, ctx);
     return body;
   });
 }
 
-// #614 async compression lifecycle: header capture (mutated in place, so the
-// held reference is the final header set), launch after the main request's
-// response arrives, and cancellation on anything that invalidates the session
-// view the fork was built from.
+// Headers are mutated in place, so the held reference is the final header set.
 function wireAsyncCompress(pi: ExtensionAPI, runtime: AcpRuntime, asyncCompress: AsyncCompressor): void {
   pi.on("session_start", (_event, ctx) => {
     asyncCompress.resetSession(ctx.sessionManager.getSessionId());
@@ -546,7 +541,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // it (issue #325, floor-stale.ts) instead of skipping the floor entirely —
       // the skip dropped the meter onto the undercounting estimate (~70-80K low)
       // and the next fresh reading snapped it back into the emergency band.
-      // #614: the async record was appended this event, after `entries` was read.
+      // The async record was appended after `entries` was read.
       const anchorEntries = asyncApplied ? [...entries, { type: "custom", customType: ASYNC_COMPRESS_CUSTOM_TYPE, data: asyncApplied.record }] : entries;
       const { predates, netReclaimed, fresh, lastRealTokens } = compressionAnchorStaleness(anchorEntries, state.blocks, defaultCountTokens);
       // issue #600: when the previous model turn yielded no fresh provider usage
@@ -920,7 +915,6 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // kernel's emergency truncation still shrinks context mechanically.
       const retryCapped = runtime.compressRetryCappedFor(sid, retryTurnKey);
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
-      // #614: a pre-launch async drop hands its nudge back to the sync path once.
       const syncRetry = !emergency && asyncCompress.takeSyncRetry(sid);
       const asyncOn = !emergency && !syncRetry && asyncCompressEligible(runtime, asyncCompress, ctx, sid);
       const alreadyShown = retryCapped || (asyncOn && asyncCompress.isActive(sid)) || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady && !syncRetry);
@@ -999,9 +993,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       }
     }
 
-    // #614 handoff: the fork's prompt is this exact view plus the nudge appended
-    // last, so only hand off when the nudge IS the final message (otherwise the
-    // fork would see a different order than the sync path) — else stay sync.
+    // The fork appends the nudge last, so hand off only when it is already last.
     if (asyncHandoff) {
       if (rebuilt[rebuilt.length - 1] === asyncHandoff.message && ctx.model) {
         rebuilt = rebuilt.slice(0, -1);

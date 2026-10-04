@@ -147,9 +147,6 @@ export type AsyncApplyOutcome =
   | { ok: true; state: CompressionState; newBlocks: CompressionBlock[] }
   | { ok: false; kind: "stale" | "invalid" | "refold"; reason: string };
 
-/** Validate a fork result against the CURRENT view and apply it all-or-nothing.
- *  Never mutates `state`: the probe pass runs on a clone and applyCompression
- *  clones again. */
 export function applyAsyncRanges(input: {
   core: CompressionCore;
   view: CoreMessage[];
@@ -173,11 +170,8 @@ export function applyAsyncRanges(input: {
   if (applied.result.errors.length > 0) return { ok: false, kind: "invalid", reason: applied.result.errors.slice(0, 3).join("; ") };
   if (applied.result.blocksCreated === 0) return { ok: false, kind: "invalid", reason: "no blocks created" };
   const newBlocks = applied.state.blocks.filter((b) => beforeRunIds.get(b.blockId) !== b.runId);
-  // The kernel refolds an inline-restored block IN PLACE (same id, new
-  // summary/runId) but keeps the block's original compressCallId, so the
-  // async record could never be matched to it again (replay/recovery) and a
-  // sync-origin block would get no carrier for its new summary. Reject the
-  // whole batch; the nudge goes back to the sync path.
+  // Kernel in-place refolds keep the block's original compressCallId, so the
+  // async record could never be matched to the block again.
   const refolded = newBlocks.filter((b) => beforeRunIds.has(b.blockId));
   if (refolded.length > 0) return { ok: false, kind: "refold", reason: `in-place refold of ${refolded.map((b) => b.blockId).join(", ")}` };
   const rewrite = tier3OnlyRewrite(newBlocks, applied.state.blocks);
@@ -189,9 +183,6 @@ export function isAsyncBlock(block: CompressionBlock): boolean {
   return block.compressCallId?.startsWith(ASYNC_CALL_ID_PREFIX) === true;
 }
 
-/** Summary carriers for active async blocks: they have no compress tool call
- *  in history to carry the summary, so the kernel-rendered summary at the
- *  block's anchor is emitted instead (see coreOutToAgentMessages). */
 export function asyncCarriers(state: CompressionState): Map<string, { label: string; timestamp: number }> {
   const out = new Map<string, { label: string; timestamp: number }>();
   for (const b of state.blocks) {
@@ -293,9 +284,6 @@ export class AsyncCompressor {
     void this.run(job, ctx);
   }
 
-  /** Main request failed: before launch the nudge goes back to the sync path;
-   *  after launch only a user abort cancels the fork (a plain error leaves a
-   *  result that still has to pass validation at the next boundary). */
   onMainFailed(sid: string, reason: string, aborted = false): void {
     const job = this.jobs.get(sid);
     if (!job) return;
@@ -356,8 +344,7 @@ export class AsyncCompressor {
     const fork = this.fork(job, ctx);
     fork.catch(() => {});
     try {
-      // The deadline settles the coordinator even when the provider or auth
-      // lookup ignores the abort signal and never settles.
+      // Settles even when the provider or auth lookup ignores the abort signal.
       const message = await Promise.race([fork, deadline]);
       if (this.jobs.get(job.sid) !== job) return;
       if (message === "deadline") {
@@ -398,8 +385,7 @@ export class AsyncCompressor {
       logInfo("async-compress", { sid: job.sid, event: "result-ready", job: job.id, ranges: ranges.length });
     } catch (e) {
       if (this.jobs.get(job.sid) !== job) return;
-      // Provider errors can echo request headers or payload: log the error
-      // class only, never its message.
+      // Provider error text can echo credentials: log the error class only.
       logWarn("async-compress", { sid: job.sid, event: "fork-threw", job: job.id, errorKind: e instanceof Error ? e.name : typeof e });
       this.abandon(job, "fork-threw", false);
       this.markFallback(job.sid, "fork-error", ctx);
@@ -436,10 +422,8 @@ export class AsyncCompressor {
   }
 }
 
-/** Apply a ready fork result at the start of a context event (caller holds
- *  the session lock). Order: validate fully in memory → append the durable
- *  replay record (failure discards the result, so an applied async block never
- *  lacks its log-replay record) → persist the sidecar → adopt the state. */
+/** Caller holds the session lock. Order: validate → append replay record
+ *  (failure discards the result) → save sidecar → adopt state. */
 export async function applyReadyAsyncResult(input: {
   compressor: AsyncCompressor;
   pi: Pick<ExtensionAPI, "appendEntry">;

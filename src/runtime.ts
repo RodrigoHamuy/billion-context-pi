@@ -815,7 +815,6 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   // a resumed session starts with an empty cache and the first context fire
   // repopulates it before any tool can run.
   const lastLiveBySession = new Map<string, AgentMessage[]>();
-  // #614: async records already re-attempted by recoverPendingAsyncRecords.
   const asyncRecoveryAttempted = new Map<string, Set<string>>();
 
   // Issue #561: per-session incremental projection cache — pi hosts rebuild the

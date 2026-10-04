@@ -60,8 +60,6 @@ function scanEntries(entries: AnchorEntry[]): AnchorScan {
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
     if (entry.type === "custom" && entry.customType === ASYNC_COMPRESS_CUSTOM_TYPE) {
-      // #614: an applied async compression lands at its record, like a
-      // successful compress toolResult does for the sync path.
       const callId = (entry.data as { callId?: unknown } | undefined)?.callId;
       if (typeof callId === "string") {
         lastCompressIdx = i;

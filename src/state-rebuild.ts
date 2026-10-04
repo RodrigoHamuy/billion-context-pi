@@ -25,8 +25,6 @@ import { sanitizeSummary } from "./summary-sanitize.js";
 
 interface CompressCall {
   entryIndex: number;
-  /** Async records (#614) replay against the view BEFORE their custom entry;
-   *  compress calls replay through their own assistant entry. */
   prefixEnd: number;
   toolCallId: string;
   ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string; summaryMaxChars?: number }>;
@@ -84,8 +82,7 @@ function asyncRecordOf(entry: SessionEntry, entryIndex: number): CompressCall | 
   return { entryIndex, prefixEnd: entryIndex, toolCallId: data.callId, ranges };
 }
 
-/** Cheap scan: does this log contain at least one non-error compress toolResult
- *  or async compression record (#614)? */
+/** Cheap scan: does this log contain at least one non-error compress toolResult or async record? */
 export function hasCompressHistory(entries: SessionEntry[]): boolean {
   for (const entry of entries) {
     if (entry.type === "custom" && asyncRecordOf(entry, 0) !== null) return true;
@@ -202,17 +199,8 @@ export function rebuildStateFromLog(input: {
   return { state, report };
 }
 
-/**
- * #614 recovery for an async record whose sidecar save never landed (the
- * record is appended before the save, so a failed save or a crash between the
- * two leaves a record whose block the existing sidecar lacks; the empty-state
- * rebuild above never runs for a non-empty sidecar). Pending = record callId
- * absent from every block (blocks are never deleted). Re-applied against the
- * CURRENT view and state exactly like the live apply; refs are never reused,
- * so the record's refs still name the same messages. Each callId is attempted
- * at most once per process (`attempted`), so an unappliable record cannot
- * re-run every turn.
- */
+/** Re-applies async records whose sidecar save never landed (record callId on
+ *  no block), at most once per callId per process. */
 export function recoverPendingAsyncRecords(input: {
   entries: SessionEntry[];
   view: CoreMessage[];

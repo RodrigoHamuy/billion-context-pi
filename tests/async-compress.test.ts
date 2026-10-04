@@ -380,8 +380,6 @@ test("proxy stand-down: with BILLION_CONTEXT_NATIVE set the async machinery stay
   }
 });
 
-// ─── parent-review fixes ──────────────────────────────────────────────────────
-
 function gatedProvider(h: Harness): { signal: () => AbortSignal | undefined; release: () => void } {
   let signal: AbortSignal | undefined;
   let release!: () => void;
