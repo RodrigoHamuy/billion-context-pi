@@ -193,3 +193,22 @@ test("/acp: successful compress after the anchor — sent-view-only metering pre
     await rm(`${stateFile}.acp.json`, { force: true });
   }
 });
+
+// review #611: pin the predates && !fresh corner (successful compress after the
+// anchor, THEN a failed latest turn). Decision stays sent-view-only; the display
+// must show the replayed anchor under the honest label instead of relabeling the
+// inflated tree-sum "Provider-reported".
+test("acp_status: post-compression + failed latest — sent-view metering kept, honest 'Last valid usage' label", async () => {
+  const stateFile = tmpPath("pai-acp-status-surf-predates-failed.session.json");
+  await rm(`${stateFile}.acp.json`, { force: true });
+  try {
+    const s = setup([...baseStream(), usedAssistant("e18", 60_000), compressResult("e19"), erroredAssistant("e20")], stateFile, 174_000);
+    const text = await statusToolText(s);
+    assert.match(text, /Nudge: idle/, "predates keeps sent-view-only metering despite the failed latest turn");
+    assert.doesNotMatch(text, /Nudge: ACTIVE/, "pre-compression tree-sum must not re-fire a nudge");
+    assert.match(text, /Last valid usage: 60\.0k/, "replayed anchor shown under the honest label");
+    assert.doesNotMatch(text, /Provider-reported/, "the inflated tree-sum is not labeled as a live provider reading");
+  } finally {
+    await rm(`${stateFile}.acp.json`, { force: true });
+  }
+});
