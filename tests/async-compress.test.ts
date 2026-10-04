@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createAcpExtension } from "../src/index.js";
 import { setRunNpmForTest } from "../src/update.js";
 import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE, ACP_NUDGE_CUSTOM_TYPE } from "../src/messages.js";
@@ -447,7 +447,7 @@ test("turning compress.async off while a result is pending discards it", async (
 });
 
 test("record written but sidecar save lost with an EXISTING non-empty sidecar: restart recovers the block from the record", async () => {
-  const { chmod, mkdtemp, readFile } = await import("node:fs/promises");
+  const { mkdir, mkdtemp, readFile } = await import("node:fs/promises");
   const dir = await mkdtemp(join(tmpdir(), "acp-async-recover-"));
   const stateFile = join(dir, "session.jsonl");
   const h = await harness("recover-1");
@@ -459,9 +459,8 @@ test("record written but sidecar save lost with an EXISTING non-empty sidecar: r
   const sidecar1 = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8")) as { blocks: Array<{ compressCallId?: string }> };
   assert.equal(sidecar1.blocks.length, 1);
 
-  // Second cycle: the session dir is read-only while the result is applied,
-  // so the record reaches the log but the sidecar write fails (store.save
-  // logs and keeps its in-memory cache — the on-disk sidecar stays at b1).
+  // Second cycle: a directory occupies the sidecar's temp path, so the record
+  // reaches the log but store.save's write fails and the on-disk sidecar stays at b1.
   grow(h, 20);
   h.forkReply = () => ({
     role: "assistant",
@@ -477,11 +476,12 @@ test("record written but sidecar save lost with an EXISTING non-empty sidecar: r
   assert.equal(nudgeRecords(), before + 1, "second nudge decided");
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 2, "second fork launched");
-  await chmod(dir, 0o555);
+  const tmpPath = join(dir, `.acp-tmp-${basename(stateFile)}.acp.json`);
+  await mkdir(tmpPath);
   try {
     await h.emit("context", { messages: [] });
   } finally {
-    await chmod(dir, 0o755);
+    await rm(tmpPath, { recursive: true, force: true });
   }
   const records = h.appended.filter((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE);
   assert.equal(records.length, 2, "second record reached the log");
