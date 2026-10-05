@@ -718,7 +718,7 @@
   - Anthropic：fork 保留主请求的缓存断点（因此前缀为缓存读取）；同步请求则会把该断点移到 nudge 上。
   - 基于环境变量认证的 provider（Bedrock、Vertex）目前属于不支持的协议，保持同步。
   - Codex（`openai-codex-responses`）：即使主 agent 使用 Codex WebSocket，fork 也始终走 HTTP/SSE，因此绝不共用主 socket 及其 `previous_response_id` 续接状态。fork 发送相同的 `prompt_cache_key` 和会话 id，OAuth token 在 fork 时经 Pi 的 provider 鉴权获取（临近过期会刷新）。主请求仍在流式输出时后端能否让 fork 的前缀命中缓存，尚未验证。
-  - claude-bridge（`claude-bridge`）：没有可重放的请求体，由 bridge 自己运行 fork。主回复开始流式输出时，ACP 在 `pi.events` 上发出 `claude-bridge:isolated-fork` 请求；服务该会话的 bridge 快照它刚服务的精确 Pi 上下文，用自身的会话重建转换器重建为一个临时 Claude Code 会话，以与主查询相同的选项和工具定义运行一次查询，拒绝所有工具调用，返回第一个 `compress` 的参数，并删除该临时会话。因此 fork 的上下文是 bridge 所服务内容的**重建**，而非 Claude Code 的实时 transcript；能否命中主会话的提示缓存尚未验证。bridge 的 `provider.strictMcpConfig` 关闭（可能加载外部 MCP 工具）或主 Claude Code 会话中的 `@file` 展开无法带入 fork 时，bridge 拒绝 fork，会话回退到同步 nudge；拒绝原因记录为 `bridge-fork-declined`。不具备该能力的 bridge 不会接受请求，会话回退到同步 nudge（`bridge-fork-unavailable`）。
+  - claude-bridge（`claude-bridge`）：没有可重放的请求体，由 bridge 自己运行 fork。主回复开始流式输出时，ACP 在 `pi.events` 上发出 `claude-bridge:isolated-fork` 请求；服务该会话的 bridge 快照它刚服务的精确 Pi 上下文，用自身的会话重建转换器重建为一个临时 Claude Code 会话，以与主查询相同的选项和工具定义运行一次查询，拒绝所有工具调用，返回第一个 `compress` 的参数，并删除该临时会话。因此 fork 的上下文是 bridge 所服务内容的**重建**，而非 Claude Code 的实时 transcript。在对 bridge 所发 Claude Code 请求的离线抓取中，fork 与主会话已缓存前缀只在系统提示词部分一致（Claude Code 把历史缓存断点放在重建内容所没有的一条消息上），因此 fork 可能把完整历史作为未缓存输入处理；不承诺任何成本节省。bridge 的 `provider.strictMcpConfig` 关闭（可能加载外部 MCP 工具）或主 Claude Code 会话中的 `@file` 展开无法带入 fork 时，bridge 拒绝 fork，会话回退到同步 nudge；拒绝原因记录为 `bridge-fork-declined`。不具备该能力的 bridge 不会接受请求，会话回退到同步 nudge（`bridge-fork-unavailable`）。
   - 若 fork 结果会对已内联还原的 block 做**原地**再折叠（同一 block id、新摘要），整批拒绝，下一次 nudge 走同步：内核在原地再折叠时保留 block 原来的 `compressCallId`，异步记录将无法再与其对应。记录恢复同样带此保护，绝不覆盖更新的 block。
 
 ### 软目标与弹性余量 (#1122)
