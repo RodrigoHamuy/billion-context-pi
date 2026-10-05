@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, createEventBus } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
-import { AsyncCompressor, BRIDGE_FORK_CHANNEL, bridgeForkMessage, takeSnapshot } from "../src/async-compress.js";
+import { AsyncCompressor, BRIDGE_FORK_CHANNEL, BRIDGE_FORK_DIRECTIVE, bridgeForkMessage, takeSnapshot } from "../src/async-compress.js";
 import { createAcpExtension } from "../src/index.js";
 import { setRunNpmForTest } from "../src/update.js";
 import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE, ACP_NUDGE_CUSTOM_TYPE } from "../src/messages.js";
@@ -80,7 +80,7 @@ test("claude-bridge: no provider capture; launches from stream start with the ex
   c.onStreamStart("bridge-ok", ctx);
   assert.equal(seen.length, 1, "requested in the stream-start tick");
   const r = seen[0]!;
-  assert.deepEqual({ version: r.version, piSessionId: r.piSessionId, prompt: r.prompt, captureTool: r.captureTool }, { version: 1, piSessionId: "bridge-ok", prompt: "NUDGE", captureTool: "compress" });
+  assert.deepEqual({ version: r.version, piSessionId: r.piSessionId, prompt: r.prompt, captureTool: r.captureTool }, { version: 1, piSessionId: "bridge-ok", prompt: `${BRIDGE_FORK_DIRECTIVE}\n\nNUDGE`, captureTool: "compress" }, "the fork is told to compress only, ahead of the same nudge the sync path shows");
   assert.ok(r.signal instanceof AbortSignal);
   await waitFor(() => c.phase("bridge-ok") === "ready");
   const ready = c.takeReady("bridge-ok")!;
@@ -173,6 +173,59 @@ test("claude-bridge: no-capture is discarded like a fork without a compress call
   bad.c.onStreamStart("bridge-bad", bad.ctx);
   await waitFor(() => !bad.c.isActive("bridge-bad"));
   assert.equal(bad.c.fallbackReason("bridge-bad"), "fork-error");
+});
+
+test("claude-bridge: a transient decline retries this nudge synchronously and keeps async, until it keeps declining", async () => {
+  const sid = "bridge-transient";
+  const h = harness(sid);
+  let reply: unknown = { ok: false, reason: "stale-context" };
+  h.bus.on(BRIDGE_FORK_CHANNEL, (data) => (data as Req).accept(Promise.resolve(reply)));
+  const round = async () => {
+    h.c.onStreamStart(sid, h.ctx);
+    await waitFor(() => !h.c.isActive(sid) || h.c.phase(sid) === "ready");
+  };
+  const restart = () => h.c.start(sid, { nudgeText: "NUDGE", snapshot: takeSnapshot([], createInitialState()), model: MODEL });
+
+  await round();
+  assert.equal(h.c.fallbackReason(sid), undefined, "one decline does not turn async off");
+  assert.equal(h.c.takeSyncRetry(sid), true, "the nudge held back for this fork is shown on the next request");
+  assert.equal(h.notes.length, 0);
+
+  reply = { ok: false, reason: "unsupported-context" };
+  restart();
+  await round();
+  assert.equal(h.c.fallbackReason(sid), undefined);
+  assert.equal(h.c.takeSyncRetry(sid), true);
+
+  reply = { ok: true, args: ARGS, usage: USAGE };
+  restart();
+  await round();
+  assert.ok(h.c.takeReady(sid), "a capture is ready and resets the count");
+
+  reply = { ok: false, reason: "stale-context" };
+  for (let i = 0; i < 2; i++) {
+    restart();
+    await round();
+    assert.equal(h.c.fallbackReason(sid), undefined, `decline ${i + 1} after a success`);
+    assert.equal(h.c.takeSyncRetry(sid), true);
+  }
+  restart();
+  await round();
+  assert.equal(h.c.fallbackReason(sid), "bridge-fork-declined", "three in a row fall back to synchronous nudges");
+  assert.equal(h.c.takeSyncRetry(sid), true);
+  assert.equal(h.notes.length, 1);
+});
+
+test("claude-bridge: a permanent decline falls back, and still retries the held-back nudge synchronously", async () => {
+  for (const reason of ["unsafe-config", "error", "no-capture-tool"]) {
+    const sid = `bridge-permanent-${reason}`;
+    const h = harness(sid);
+    h.bus.on(BRIDGE_FORK_CHANNEL, (data) => (data as Req).accept(Promise.resolve({ ok: false, reason })));
+    h.c.onStreamStart(sid, h.ctx);
+    await waitFor(() => !h.c.isActive(sid));
+    assert.equal(h.c.fallbackReason(sid), "fork-error", reason);
+    assert.equal(h.c.takeSyncRetry(sid), true, reason);
+  }
 });
 
 test("claude-bridge: cancel and the fork deadline abort the signal the bridge holds", async () => {
@@ -294,7 +347,8 @@ test("claude-bridge main: real Agent turn over pi.events forks the request being
 
   assert.equal(requests.length, 1, "one fork request for the nudged turn");
   assert.equal(servedAtAccept[0], lastServed, "accepted while the bridge's last served request was the turn being streamed");
-  assert.ok(requests[0]!.prompt.length > 0);
+  assert.ok(requests[0]!.prompt.startsWith(`${BRIDGE_FORK_DIRECTIVE}\n\n`));
+  assert.ok(requests[0]!.prompt.length > BRIDGE_FORK_DIRECTIVE.length + 2, "the nudge follows the directive");
   await waitFor(() => logged(sid, "result-ready"));
 
   const r = (await emit("context", { messages: [] })) as { messages: Array<{ role: string; content: unknown }> };

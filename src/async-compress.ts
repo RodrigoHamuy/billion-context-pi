@@ -15,8 +15,16 @@ export const ASYNC_FORK_TIMEOUT_MS = 5 * 60_000;
 export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses", "claude-bridge"]);
 // No request body to replay: the provider runs the fork itself over pi.events (pi-claude-bridge isolated-fork).
 const BRIDGE_FORK_APIS: ReadonlySet<string> = new Set(["claude-bridge"]);
+// The bridge declines these before any model call: what the main session holds no
+// longer matches the request, or is not on disk yet. The next request nudges
+// synchronously; only a session that keeps declining stops trying async.
+const BRIDGE_TRANSIENT_DECLINES: ReadonlySet<string> = new Set(["stale-context", "unsupported-context"]);
+const BRIDGE_DECLINE_LIMIT = 3;
 export const isBridgeForkApi = (api: unknown): boolean => BRIDGE_FORK_APIS.has(String(api));
 export const BRIDGE_FORK_CHANNEL = "claude-bridge:isolated-fork";
+// The bridge forks after the main turn's answer, so the fork's last message is
+// this prompt; the main session, not the fork, carries on with the user's task.
+export const BRIDGE_FORK_DIRECTIVE = "Background compression pass. The user's task is handled in the main conversation: do not continue or answer it, and do not call any tool other than `compress`. Make exactly one `compress` call, citing only message ids already shown above, as the context notice below describes.";
 const RESPONSES_APIS: ReadonlySet<string> = new Set(["openai-responses", "openai-codex-responses"]);
 
 const SERVER_STATE_KEYS = ["previous_response_id", "conversation", "context_management"];
@@ -62,6 +70,7 @@ interface Job {
   timer?: ReturnType<typeof setTimeout>;
   ranges?: AsyncRange[];
   bridgeFork?: Promise<unknown>;
+  bridgeDeclined?: string;
 }
 
 interface ForkMessage {
@@ -221,6 +230,7 @@ export class AsyncCompressor {
   private readonly syncRetry = new Set<string>();
   private readonly fallback = new Map<string, string>();
   private readonly notified = new Set<string>();
+  private readonly bridgeDeclines = new Map<string, number>();
   private readonly timeoutMs: number;
 
   constructor(private readonly deps: AsyncCompressDeps) {
@@ -320,7 +330,7 @@ export class AsyncCompressor {
       this.deps.pi.events.emit(BRIDGE_FORK_CHANNEL, {
         version: 1,
         piSessionId: job.sid,
-        prompt: job.nudgeText,
+        prompt: `${BRIDGE_FORK_DIRECTIVE}\n\n${job.nudgeText}`,
         captureTool: "compress",
         signal: job.controller.signal,
         // Returns whether this acceptance was taken, so a later acceptor can skip the work.
@@ -368,6 +378,7 @@ export class AsyncCompressor {
     this.syncRetry.delete(sid);
     this.fallback.delete(sid);
     this.notified.delete(sid);
+    this.bridgeDeclines.delete(sid);
   }
 
   takeReady(sid: string): { id: string; ranges: AsyncRange[]; snapshot: ViewSnapshot } | undefined {
@@ -407,7 +418,11 @@ export class AsyncCompressor {
     const fork = job.bridgeFork
       ? job.bridgeFork.then((result) => {
           const message = bridgeForkMessage(result);
-          if (message.stopReason === "error") logWarn("async-compress", { sid: job.sid, event: "bridge-fork-declined", job: job.id, reason: bridgeFailureReason(result) });
+          if (message.stopReason === "error") {
+            const reason = bridgeFailureReason(result);
+            logWarn("async-compress", { sid: job.sid, event: "bridge-fork-declined", job: job.id, reason });
+            if (isRecord(result) && result.ok === false) job.bridgeDeclined = reason;
+          }
           return message;
         })
       : this.fork(job, ctx);
@@ -433,8 +448,16 @@ export class AsyncCompressor {
         cacheRead: usage?.cacheRead ?? null,
         cacheWrite: usage?.cacheWrite ?? null,
       });
+      if (job.bridgeDeclined !== undefined && BRIDGE_TRANSIENT_DECLINES.has(job.bridgeDeclined)) {
+        this.abandon(job, `bridge-declined:${job.bridgeDeclined}`, true);
+        const declines = (this.bridgeDeclines.get(job.sid) ?? 0) + 1;
+        this.bridgeDeclines.set(job.sid, declines);
+        if (declines >= BRIDGE_DECLINE_LIMIT) this.markFallback(job.sid, "bridge-fork-declined", ctx);
+        return;
+      }
       if (message.stopReason === "error" || message.stopReason === "aborted") {
-        this.abandon(job, `fork-${message.stopReason}`, false);
+        // A bridge that declined ran nothing, so the nudge it held back is shown next request.
+        this.abandon(job, `fork-${message.stopReason}`, job.bridgeDeclined !== undefined);
         this.markFallback(job.sid, timedOut ? "fork-timeout" : "fork-error", ctx);
         return;
       }
@@ -451,6 +474,7 @@ export class AsyncCompressor {
       }
       job.ranges = ranges;
       job.phase = "ready";
+      this.bridgeDeclines.delete(job.sid);
       logInfo("async-compress", { sid: job.sid, event: "result-ready", job: job.id, ranges: ranges.length });
     } catch (e) {
       if (this.jobs.get(job.sid) !== job) return;

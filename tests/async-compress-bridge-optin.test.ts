@@ -210,3 +210,25 @@ test("a ready bridge result is gated by the job's API, not the model switched to
   assert.equal(s.appended.filter((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE).length, 0, "bridge result not applied without the bridge opt-in");
   assert.equal(logLines(sid, "result-discarded").length, 0, "dropped by the opt-out, not by validation");
 });
+
+test("a nudge held back for a declined bridge fork is shown on the next request, though the kernel's cadence already counted it", async () => {
+  const sid = "optin-declined-retry";
+  const s = await session(sid, { async: true, asyncClaudeBridge: true }, { onFork: (r) => r.accept(Promise.resolve({ ok: false, reason: "stale-context" })) });
+  const r = await s.turn();
+  assert.ok(!s.syncNudged(r), "nudge handed to the fork");
+  assert.equal(s.requests.length, 1);
+  await waitFor(() => logLines(sid, "job-dropped").length > 0);
+  assert.ok(s.syncNudged(await s.emit("context", { messages: [] })), "the held-back nudge is shown synchronously");
+  assert.ok(!s.syncNudged(await s.emit("context", { messages: [] })), "and only once");
+  assert.equal(s.requests.length, 1, "the retry does not start another fork");
+  assert.equal(logLines(sid, "sync-fallback").length, 0, "one decline keeps async on");
+});
+
+test("a fork that applies owes no nudge on the next request", async () => {
+  const sid = "optin-applied-no-retry";
+  const s = await session(sid, { async: true, asyncClaudeBridge: true }, { onFork: (r) => r.accept(Promise.resolve(READY)) });
+  await s.turn();
+  await waitFor(() => logLines(sid, "result-ready").length > 0);
+  assert.ok(!s.syncNudged(await s.emit("context", { messages: [] })));
+  assert.ok(!s.syncNudged(await s.emit("context", { messages: [] })));
+});

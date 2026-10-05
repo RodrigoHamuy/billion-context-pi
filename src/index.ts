@@ -901,7 +901,10 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     }
 
     let asyncHandoff: { message: AgentMessage; text: string } | null = null;
-    if (turn.nudge?.shouldInject) {
+    // A nudge held back for a fork that ran nothing is owed now, though the
+    // kernel's cadence already counted it as shown.
+    const owedRetry = !!turn.nudge && !turn.nudge.shouldInject && viableRanges(turn.nudge.compressibleRanges).length > 0 && asyncCompress.takeSyncRetry(sid);
+    if (turn.nudge && (turn.nudge.shouldInject || owedRetry)) {
       // Two independent channels for the nudge:
       //  1. CONTEXT injection (always on): the nudge is appended to the
       //     messages returned to the LLM so the model sees it and compresses.
@@ -938,7 +941,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // kernel's emergency truncation still shrinks context mechanically.
       const retryCapped = runtime.compressRetryCappedFor(sid, retryTurnKey);
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
-      const syncRetry = !emergency && asyncCompress.takeSyncRetry(sid);
+      const syncRetry = owedRetry || (!emergency && asyncCompress.takeSyncRetry(sid));
       const asyncOn = !emergency && !syncRetry && asyncCompressEligible(runtime, asyncCompress, ctx, sid);
       const alreadyShown = retryCapped || (asyncOn && asyncCompress.isActive(sid)) || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady && !syncRetry);
       if (!alreadyShown) {
