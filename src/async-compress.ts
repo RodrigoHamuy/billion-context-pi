@@ -12,7 +12,10 @@ import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE } from "./messages.js"
 export { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE };
 
 export const ASYNC_FORK_TIMEOUT_MS = 5 * 60_000;
-export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses"]);
+export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses", "claude-bridge"]);
+// No request body to replay: the provider runs the fork itself over pi.events (pi-claude-bridge isolated-fork).
+const BRIDGE_FORK_APIS: ReadonlySet<string> = new Set(["claude-bridge"]);
+export const BRIDGE_FORK_CHANNEL = "claude-bridge:isolated-fork";
 const RESPONSES_APIS: ReadonlySet<string> = new Set(["openai-responses", "openai-codex-responses"]);
 
 const SERVER_STATE_KEYS = ["previous_response_id", "conversation", "context_management"];
@@ -57,6 +60,13 @@ interface Job {
   controller: AbortController;
   timer?: ReturnType<typeof setTimeout>;
   ranges?: AsyncRange[];
+  bridgeFork?: Promise<unknown>;
+}
+
+interface ForkMessage {
+  stopReason: string;
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  content: ReadonlyArray<{ type: string; name?: string; arguments?: unknown }>;
 }
 
 type ProviderLike = NonNullable<ReturnType<ExtensionContext["modelRegistry"]["getProvider"]>>;
@@ -200,7 +210,7 @@ export function asyncEnabledValue(value: unknown, warn: (v: unknown) => void): b
 }
 
 export interface AsyncCompressDeps {
-  pi: Pick<ExtensionAPI, "appendEntry" | "getThinkingLevel" | "getActiveTools" | "getAllTools">;
+  pi: Pick<ExtensionAPI, "appendEntry" | "getThinkingLevel" | "getActiveTools" | "getAllTools" | "events">;
   now?: () => number;
   timeoutMs?: number;
 }
@@ -263,7 +273,7 @@ export class AsyncCompressor {
 
   onPayload(sid: string, payload: unknown, ctx: ExtensionContext): void {
     const job = this.jobs.get(sid);
-    if (!job || job.phase !== "awaiting-request") return;
+    if (!job || job.phase !== "awaiting-request" || BRIDGE_FORK_APIS.has(job.api)) return;
     const reason = unsupportedPayloadReason(job.api, payload);
     if (reason !== null) {
       this.abandon(job, `capture:${reason}`, true);
@@ -286,12 +296,50 @@ export class AsyncCompressor {
 
   onStreamStart(sid: string, ctx: ExtensionContext): void {
     const job = this.jobs.get(sid);
-    if (job && job.phase === "awaiting-response" && job.api === "openai-codex-responses") this.launch(job, ctx);
+    if (!job) return;
+    if (job.phase === "awaiting-response" && job.api === "openai-codex-responses") this.launch(job, ctx);
+    else if (job.phase === "awaiting-request" && BRIDGE_FORK_APIS.has(job.api)) this.launchBridge(job, ctx);
   }
 
   private launch(job: Job, ctx: ExtensionContext): void {
     job.phase = "running";
     void this.run(job, ctx);
+  }
+
+  // The provider snapshots the request it is serving when it accepts, so this must
+  // run while that request is still the one streaming.
+  private launchBridge(job: Job, ctx: ExtensionContext): void {
+    let accepted: Promise<unknown> | undefined;
+    let accepts = 0;
+    try {
+      this.deps.pi.events.emit(BRIDGE_FORK_CHANNEL, {
+        version: 1,
+        piSessionId: job.sid,
+        prompt: job.nudgeText,
+        captureTool: "compress",
+        signal: job.controller.signal,
+        // Returns whether this acceptance was taken, so a later acceptor can skip the work.
+        accept: (result: unknown): boolean => {
+          accepts++;
+          if (!isRecord(result) || typeof result.then !== "function") return false;
+          const promise = Promise.resolve(result);
+          promise.catch(() => {});
+          if (accepted) return false;
+          accepted = promise;
+          return true;
+        },
+      });
+    } catch {
+      logWarn("async-compress", { sid: job.sid, event: "bridge-fork-listener-threw", job: job.id });
+    }
+    if (accepts > 1) logWarn("async-compress", { sid: job.sid, event: "bridge-fork-extra-accept", job: job.id, accepts });
+    if (!accepted) {
+      this.abandon(job, "bridge-fork-unavailable", true);
+      this.markFallback(job.sid, "bridge-fork-unavailable", ctx);
+      return;
+    }
+    job.bridgeFork = accepted;
+    this.launch(job, ctx);
   }
 
   onMainFailed(sid: string, reason: string, aborted = false): void {
@@ -351,7 +399,13 @@ export class AsyncCompressor {
         resolve("deadline");
       }, this.timeoutMs);
     });
-    const fork = this.fork(job, ctx);
+    const fork = job.bridgeFork
+      ? job.bridgeFork.then((result) => {
+          const message = bridgeForkMessage(result);
+          if (message.stopReason === "error") logWarn("async-compress", { sid: job.sid, event: "bridge-fork-declined", job: job.id, reason: bridgeFailureReason(result) });
+          return message;
+        })
+      : this.fork(job, ctx);
     fork.catch(() => {});
     try {
       // Settles even when the provider or auth lookup ignores the abort signal.
@@ -380,7 +434,7 @@ export class AsyncCompressor {
         return;
       }
       const call = message.content.find((c) => c.type === "toolCall" && c.name === "compress");
-      if (!call || call.type !== "toolCall") {
+      if (!call) {
         this.abandon(job, "fork-no-compress-call", false);
         return;
       }
@@ -404,7 +458,7 @@ export class AsyncCompressor {
     }
   }
 
-  private async fork(job: Job, ctx: ExtensionContext) {
+  private async fork(job: Job, ctx: ExtensionContext): Promise<ForkMessage> {
     const provider = ctx.modelRegistry.getProvider(job.provider);
     if (!provider) throw new Error("unknown provider");
     const auth = await ctx.modelRegistry.getProviderAuth(job.provider);
@@ -432,6 +486,28 @@ export class AsyncCompressor {
       .filter((t) => active.has(t.name))
       .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
   }
+}
+
+function isUsage(v: unknown): v is NonNullable<ForkMessage["usage"]> {
+  return isRecord(v) && ["input", "output", "cacheRead", "cacheWrite"].every((k) => typeof v[k] === "number");
+}
+
+function bridgeFailureReason(result: unknown): string {
+  const reason = isRecord(result) ? result.reason : undefined;
+  return typeof reason === "string" && /^[a-z-]{1,40}$/.test(reason) ? reason : "malformed";
+}
+
+/** Maps the bridge's fork result onto the shape a provider fork returns; anything malformed is an error. */
+export function bridgeForkMessage(result: unknown): ForkMessage {
+  if (!isRecord(result) || typeof result.ok !== "boolean") return { stopReason: "error", content: [] };
+  const usage = isUsage(result.usage) ? result.usage : undefined;
+  if (result.ok) {
+    if (!isRecord(result.args)) return { stopReason: "error", content: [] };
+    return { stopReason: "toolUse", ...(usage ? { usage } : {}), content: [{ type: "toolCall", name: "compress", arguments: result.args }] };
+  }
+  if (result.reason === "no-capture") return { stopReason: "stop", ...(usage ? { usage } : {}), content: [] };
+  if (result.reason === "aborted") return { stopReason: "aborted", ...(usage ? { usage } : {}), content: [] };
+  return { stopReason: "error", ...(usage ? { usage } : {}), content: [] };
 }
 
 /** Caller holds the session lock. Order: validate → append replay record
