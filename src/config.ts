@@ -183,6 +183,9 @@ export interface CompressSettings {
   /** Opt-in (#614). Default: false. When true, non-emergency nudges are answered
    *  by a same-model fork in the background; emergency nudges stay synchronous. */
   async?: boolean;
+  /** Experimental, default false. claude-bridge async also needs this: its fork
+   *  showed system-prompt-only cache reuse in testing (pi-claude-bridge #161). */
+  asyncClaudeBridge?: boolean;
 }
 
 /** Per-provider compression overrides. Carries the same tuning fields as the
@@ -574,6 +577,7 @@ export function mergeCompress(
     stripImages: model?.stripImages ?? provider?.stripImages ?? global?.stripImages,
     stripImagesKeepRecent: model?.stripImagesKeepRecent ?? provider?.stripImagesKeepRecent ?? global?.stripImagesKeepRecent,
     async: model?.async ?? provider?.async ?? global?.async,
+    asyncClaudeBridge: model?.asyncClaudeBridge ?? provider?.asyncClaudeBridge ?? global?.asyncClaudeBridge,
   };
 }
 

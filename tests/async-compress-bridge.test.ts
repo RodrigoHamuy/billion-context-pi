@@ -250,7 +250,7 @@ test("claude-bridge main: real Agent turn over pi.events forks the request being
     getAllTools: () => [{ name: "compress", description: "Compress ranges", parameters: { type: "object", properties: {} } }],
     events: bus,
   };
-  createAcpExtension({ modelContextLimit: 200_000, autoUpdate: false, compress: { async: true } })(pi as never);
+  createAcpExtension({ modelContextLimit: 200_000, autoUpdate: false, compress: { async: true, asyncClaudeBridge: true } })(pi as never);
   const model = { ...MODEL, contextWindow: 200_000, maxTokens: 8000, input: ["text"], reasoning: false, baseUrl: "claude-bridge", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const ctx = {
     mode: "rpc",

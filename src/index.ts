@@ -23,7 +23,7 @@ import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
 import { coreOutToAgentMessages, extractText, ACP_NUDGE_CUSTOM_TYPE, ASYNC_COMPRESS_CUSTOM_TYPE, type AcpNudgeRecord } from "./messages.js";
-import { AsyncCompressor, ASYNC_SUPPORTED_APIS, applyReadyAsyncResult, asyncCarriers, asyncEnabledValue, takeSnapshot } from "./async-compress.js";
+import { AsyncCompressor, ASYNC_SUPPORTED_APIS, applyReadyAsyncResult, asyncCarriers, asyncEnabledValue, isBridgeForkApi, takeSnapshot } from "./async-compress.js";
 import { liveOnlyTailCached, dropLiveOnlyTailCache } from "./live-only-tail.js";
 import { carryHostSystemMessages } from "./system-passthrough.js";
 import { sanitizeToolPairing } from "./tool-pair-sanitizer.js";
@@ -447,14 +447,30 @@ function wireAsyncCompress(pi: ExtensionAPI, runtime: AcpRuntime, asyncCompress:
 }
 
 let asyncValueWarned = false;
+let bridgeValueWarned = false;
+const bridgeOptInLogged = new Set<string>();
 
-function asyncConfigured(runtime: AcpRuntime, ctx: ExtensionContext): boolean {
+// claude-bridge async needs compress.asyncClaudeBridge as well; `api` defaults to the current model's.
+function asyncConfigured(runtime: AcpRuntime, ctx: ExtensionContext, api: unknown = ctx.model?.api): boolean {
   const m = ctx.model as { provider?: string; id?: string } | undefined;
-  return asyncEnabledValue(resolveCompress(runtime.adapter.compress, m?.provider, m?.id).async, (v) => {
+  const settings = resolveCompress(runtime.adapter.compress, m?.provider, m?.id);
+  const on = asyncEnabledValue(settings.async, (v) => {
     if (asyncValueWarned) return;
     asyncValueWarned = true;
     logWarn("config", { event: "compress-async-invalid", value: JSON.stringify(v), fallback: false });
   });
+  if (!on || !isBridgeForkApi(api)) return on;
+  const bridge = asyncEnabledValue(settings.asyncClaudeBridge, (v) => {
+    if (bridgeValueWarned) return;
+    bridgeValueWarned = true;
+    logWarn("config", { event: "compress-async-claude-bridge-invalid", type: Array.isArray(v) ? "array" : v === null ? "null" : typeof v, expected: "boolean", fallback: false });
+  });
+  const sid = ctx.sessionManager.getSessionId();
+  if (!bridge && !bridgeOptInLogged.has(sid)) {
+    bridgeOptInLogged.add(sid);
+    logInfo("async-compress", { sid, event: "bridge-async-not-enabled", hint: "set compress.asyncClaudeBridge to true to opt in (experimental)" });
+  }
+  return bridge;
 }
 
 function asyncCompressEligible(runtime: AcpRuntime, asyncCompress: AsyncCompressor, ctx: ExtensionContext, sid: string): boolean {
@@ -491,7 +507,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       const loaded = await runtime.stateFor(ctx, event.messages);
       const { coreMessages, entries } = loaded;
       const configBase = runtime.configFor(ctx);
-      const asyncApplied = await applyReadyAsyncResult({ compressor: asyncCompress, pi, ctx, core: runtime.core, config: configBase, view: coreMessages, state: loaded.state, entries, save: (next) => runtime.save(next, ctx), enabled: asyncConfigured(runtime, ctx) });
+      const asyncApplied = await applyReadyAsyncResult({ compressor: asyncCompress, pi, ctx, core: runtime.core, config: configBase, view: coreMessages, state: loaded.state, entries, save: (next) => runtime.save(next, ctx), enabled: asyncConfigured(runtime, ctx) && asyncConfigured(runtime, ctx, asyncCompress.jobApi(sid) ?? ctx.model?.api) });
       const state = asyncApplied?.state ?? loaded.state;
       const ov = runtime.overflowFor(sid);
       // Self-heal: a prior upstream overflow may have taught us the real window

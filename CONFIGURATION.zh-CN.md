@@ -185,6 +185,7 @@
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **可选开启**：wire 层剥离历史图像载荷（issue #321）。为 `true` 时，除最近 `stripImagesKeepRecent` 条消息外，历史消息的图像部分在上游请求体中被剥离；纯图像消息折叠为 `"[image]"` 文本占位符。支持协议：anthropic-messages、openai-completions、openai-responses（含 azure/codex 变体）。 |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | `stripImages` 开启时保留图像载荷的最近消息条数。 |
 | `compress.async` | boolean | `false` | 🟢 ACTIVE | **可选开启，实验性**：异步压缩（#614）。非紧急 nudge 交给刚发出的请求的同模型 fork 处理，主 agent 继续工作；校验通过的摘要在下一个请求边界生效。详见 [`compress.async`](#compressasync)。 |
+| `compress.asyncClaudeBridge` | boolean | `false` | 🟢 ACTIVE | **实验性**：`claude-bridge` 异步压缩的第二个开关，还需同时开启 `compress.async: true`。bridge fork 目前只复用系统提示词缓存，可能比同步压缩更耗用量。详见 [`compress.asyncClaudeBridge`](#compressasyncclaudebridge)。 |
 
 **prompts 键**
 
@@ -710,7 +711,7 @@
   4. 在下一个请求边界（下一个 `context` 事件，持有会话锁）对结果做校验：fork 看到的历史必须仍是当前视图的精确前缀、引用的 ref 必须绑定到同一消息、活跃 block 集合不变（例如期间没有落地其他 compress）。然后经过与 `compress` 工具相同的内核校验，**全有或全无**地应用。过期或无效的结果直接丢弃，实时状态不受影响。
   5. 成功时先向会话日志追加一条只读的 `acp-async-compress` 记录，**然后**才采用新状态（记录写不进去则丢弃结果）。该记录保存已应用的 range，`.acp.json` sidecar 丢失时可按日志顺序与普通 compress 调用一起重放重建；若只是 sidecar 写入丢失（记录存在、已有 sidecar 缺该 block），下一次加载会基于当前视图重新应用该记录。block 摘要以稳定的 user 角色检查点出现在 block 位置（`[Compressed conversation section] … [ACP async compression: bN=mA–mB]`）；对 `bN` 的再折叠与 decompress 与普通 block 相同。
 
-  **仍走同步：** 紧急 nudge；nudge 不是请求最后一条消息时；fork 进行中时后续非紧急 nudge 暂缓。**适用范围：** 仅 Pi 宿主；协议 `anthropic-messages`、`openai-completions`、`openai-responses`、`openai-codex-responses`（ChatGPT/Codex 登录）、`claude-bridge`（仅限能响应 isolated-fork 请求的 pi-claude-bridge 版本，见下）；且无服务端会话状态（`previous_response_id` / `conversation` / `context_management`）。其他情况、fork 请求失败、fork 输出无效、5 分钟 fork 超时、或记录写入失败，都会让该会话回退到同步 nudge（每会话一条提示）。会话切换 / fork / 树导航 / 压缩（compaction）/ 切换模型 / 关闭，或用户中止主请求，都会中止进行中的 fork；关闭 `compress.async` 会丢弃待应用的结果。代理 / native 让位以及被拒绝的宿主上该功能不生效。
+  **仍走同步：** 紧急 nudge；nudge 不是请求最后一条消息时；fork 进行中时后续非紧急 nudge 暂缓。**适用范围：** 仅 Pi 宿主；协议 `anthropic-messages`、`openai-completions`、`openai-responses`、`openai-codex-responses`（ChatGPT/Codex 登录）、`claude-bridge`（还需 [`compress.asyncClaudeBridge`](#compressasyncclaudebridge) 为 `true`，且 pi-claude-bridge 版本能响应 isolated-fork 请求，见下）；且无服务端会话状态（`previous_response_id` / `conversation` / `context_management`）。其他情况、fork 请求失败、fork 输出无效、5 分钟 fork 超时、或记录写入失败，都会让该会话回退到同步 nudge（每会话一条提示）。会话切换 / fork / 树导航 / 压缩（compaction）/ 切换模型 / 关闭，或用户中止主请求，都会中止进行中的 fork；关闭 `compress.async` 会丢弃待应用的结果。代理 / native 让位以及被拒绝的宿主上该功能不生效。
 
   **限制：**
   - fork 复用的是 **ACP 的 `before_provider_request` 处理器所看到的** provider 载荷。Pi 允许后加载的扩展*替换*该载荷，而这种替换对扩展不可见；存在此类扩展时，fork 读到的字节可能与主请求不同（缓存未命中，摘要可能涉及主 agent 未看到的内容）。后续 `before_provider_headers` 处理器原地修改的请求头*会*被包含。校验证明的是历史结构与 ref，而不是摘要忠实于 ACP 从未见过的字节。
@@ -720,6 +721,29 @@
   - Codex（`openai-codex-responses`）：即使主 agent 使用 Codex WebSocket，fork 也始终走 HTTP/SSE，因此绝不共用主 socket 及其 `previous_response_id` 续接状态。fork 发送相同的 `prompt_cache_key` 和会话 id，OAuth token 在 fork 时经 Pi 的 provider 鉴权获取（临近过期会刷新）。主请求仍在流式输出时后端能否让 fork 的前缀命中缓存，尚未验证。
   - claude-bridge（`claude-bridge`）：没有可重放的请求体，由 bridge 自己运行 fork。主回复开始流式输出时，ACP 在 `pi.events` 上发出 `claude-bridge:isolated-fork` 请求；服务该会话的 bridge 快照它刚服务的精确 Pi 上下文，用自身的会话重建转换器重建为一个临时 Claude Code 会话，以与主查询相同的选项和工具定义运行一次查询，拒绝所有工具调用，返回第一个 `compress` 的参数，并删除该临时会话。因此 fork 的上下文是 bridge 所服务内容的**重建**，而非 Claude Code 的实时 transcript。在对 bridge 所发 Claude Code 请求的离线抓取中，fork 与主会话已缓存前缀只在系统提示词部分一致（Claude Code 把历史缓存断点放在重建内容所没有的一条消息上），因此 fork 可能把完整历史作为未缓存输入处理；不承诺任何成本节省。bridge 的 `provider.strictMcpConfig` 关闭（可能加载外部 MCP 工具）或主 Claude Code 会话中的 `@file` 展开无法带入 fork 时，bridge 拒绝 fork，会话回退到同步 nudge；拒绝原因记录为 `bridge-fork-declined`。不具备该能力的 bridge 不会接受请求，会话回退到同步 nudge（`bridge-fork-unavailable`）。
   - 若 fork 结果会对已内联还原的 block 做**原地**再折叠（同一 block id、新摘要），整批拒绝，下一次 nudge 走同步：内核在原地再折叠时保留 block 原来的 `compressCallId`，异步记录将无法再与其对应。记录恢复同样带此保护，绝不覆盖更新的 block。
+
+### `compress.asyncClaudeBridge`
+
+- **类型：** `boolean`
+- **默认：** `false`
+- **状态：** 🟢 ACTIVE（实验性）
+- **描述：** `claude-bridge` 协议上异步压缩的单独开关。在 `claude-bridge` 上，只有 `compress.async` 与 `compress.asyncClaudeBridge` **都**解析为字面量 `true` 时才走异步。两者都与其他 `compress.*` 字段走同一 `models > providers > global` 三级级联。其他协议忽略此字段。
+
+  **为什么要第二个开关：** bridge fork 会把对话重建为一个临时 Claude Code 会话。离线抓取中它与主会话只共享系统提示词缓存，因此可能把完整历史作为未缓存输入处理，比同步压缩请求更耗用量（[pi-claude-bridge #161](https://github.com/elidickinson/pi-claude-bridge/issues/161)）。仅开启 `compress.async` 并不代表接受这一风险。
+
+  `compress.async: true` 而本字段关闭时，`claude-bridge` 会话保持同步 nudge。这不算失败：ACP 每会话记录一次 `bridge-async-not-enabled`，不显示回退提示。bridge fork 运行中或结果待应用时关闭本字段，会中止 fork 并丢弃结果，与关闭 `compress.async` 相同。非布尔值会记录 `compress-async-claude-bridge-invalid`（只记值的类型）并视为关闭。
+
+  **草案测试者：** 以前 `compress.async: true` 也会开启 bridge。要保留 bridge 异步，请加上本字段：
+
+  ```json
+  { "compress": { "async": true, "asyncClaudeBridge": true } }
+  ```
+
+  或只对 bridge provider 开启：
+
+  ```json
+  { "compress": { "async": true, "providers": { "claude-bridge": { "asyncClaudeBridge": true } } } }
+  ```
 
 ### 软目标与弹性余量 (#1122)
 

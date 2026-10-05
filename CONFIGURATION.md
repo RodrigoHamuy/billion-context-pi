@@ -186,6 +186,7 @@ All keys below are currently **ACTIVE**.
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **Opt-in** wire-level strip of historical image payloads (issue #321). When `true`, every message older than the most recent `stripImagesKeepRecent` has its image parts dropped from the outbound provider body; image-only messages collapse to a `"[image]"` text placeholder. Supported wire dialects: anthropic-messages, openai-completions, openai-responses (incl. azure/codex variants). |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | How many of the most recent messages keep their image payloads when `stripImages` is on. |
 | `compress.async` | boolean | `false` | 🟢 ACTIVE | **Opt-in, experimental** async compression (#614). A non-emergency nudge is answered by a same-model fork of the request that was just sent while the main agent continues; the validated summary is applied at the next request boundary. See [`compress.async`](#compressasync). |
+| `compress.asyncClaudeBridge` | boolean | `false` | 🟢 ACTIVE | **Experimental** second opt-in for async compression on `claude-bridge`. Needs `compress.async: true` as well. The bridge fork currently reuses only the system-prompt cache, so it may cost more than synchronous compression. See [`compress.asyncClaudeBridge`](#compressasyncclaudebridge). |
 
 **Prompts keys**
 
@@ -714,7 +715,7 @@ The flow is:
   4. At the next request boundary (the next `context` event, under the session lock) the result is validated against the current session: the history the fork saw must still be an exact prefix of the current view, the cited refs must bind to the same messages, and the active block set must be unchanged (e.g. no compress landed meanwhile). It then passes the same kernel validation as the `compress` tool and applies **all-or-nothing**. A stale or invalid result is discarded and the live state is untouched.
   5. On success a display-only `acp-async-compress` entry is appended to the session log **before** the new state is adopted (if it cannot be written the result is discarded). It records the applied ranges so a lost `.acp.json` sidecar can be rebuilt from the log, in log order with ordinary compress calls; if only the sidecar write was lost (record present, block missing from an existing sidecar), the next load re-applies the record against the current view. The block's summary reaches the model as a stable user-role checkpoint at the block's position (`[Compressed conversation section] … [ACP async compression: bN=mA–mB]`); refolding or decompressing `bN` works as for any block.
 
-  **Stays synchronous:** emergency nudges; a nudge that is not the last message of the request; while a fork is in flight, further non-emergency nudges are held back. **Scope:** Pi host only, wires `anthropic-messages`, `openai-completions`, `openai-responses`, `openai-codex-responses` (ChatGPT/Codex login), `claude-bridge` (only with a pi-claude-bridge build that answers the isolated-fork request; see below), and no server-side conversation state (`previous_response_id` / `conversation` / `context_management`). Anything else, a failed fork request, invalid fork output, the 5-minute fork timeout, or a failed record write switches the session back to synchronous nudges (one notice per session). Session switch / fork / tree navigation / compaction / model change / shutdown, or a user abort of the main request, abort an in-flight fork; turning `compress.async` off discards any pending result. Under the proxy / native stand-down and on refused hosts the feature is inert.
+  **Stays synchronous:** emergency nudges; a nudge that is not the last message of the request; while a fork is in flight, further non-emergency nudges are held back. **Scope:** Pi host only, wires `anthropic-messages`, `openai-completions`, `openai-responses`, `openai-codex-responses` (ChatGPT/Codex login), `claude-bridge` (only with [`compress.asyncClaudeBridge`](#compressasyncclaudebridge) also `true` and a pi-claude-bridge build that answers the isolated-fork request; see below), and no server-side conversation state (`previous_response_id` / `conversation` / `context_management`). Anything else, a failed fork request, invalid fork output, the 5-minute fork timeout, or a failed record write switches the session back to synchronous nudges (one notice per session). Session switch / fork / tree navigation / compaction / model change / shutdown, or a user abort of the main request, abort an in-flight fork; turning `compress.async` off discards any pending result. Under the proxy / native stand-down and on refused hosts the feature is inert.
 
   **Limitations:**
   - The fork reuses the provider payload **as seen by ACP's `before_provider_request` handler**. Pi lets later-loaded extensions *replace* that payload, and the replacement is not observable from an extension; with such an extension the fork can read different bytes than the main request (cache miss, and a summary of content the main agent did not see). Header changes made in place by later `before_provider_headers` handlers *are* included. Validation proves the history structure and refs, not that the summary is faithful to bytes ACP never saw.
@@ -724,6 +725,29 @@ The flow is:
   - Codex (`openai-codex-responses`): the fork always goes over HTTP/SSE, even when the main agent uses the Codex WebSocket, so it never shares the main socket or its `previous_response_id` continuation. It sends the same `prompt_cache_key` and session id, and its OAuth token comes from Pi's provider auth at fork time (refreshed if close to expiry). Whether the backend serves the fork's prefix from cache while the main request is still streaming is not verified.
   - claude-bridge (`claude-bridge`): there is no request body to replay, so the bridge runs the fork itself. At the main reply's stream start ACP emits a `claude-bridge:isolated-fork` request on `pi.events`; a bridge that served the session snapshots the exact Pi context it just served, rebuilds it into a throwaway Claude Code session with its own session-rebuild converter, runs one query with the main query's options and tool definitions, refuses every tool call, returns the first `compress` arguments, and deletes the throwaway session. The fork's context is therefore a **reconstruction** of what the bridge served, not Claude Code's live transcript. In an offline capture of the bridge's Claude Code requests, the fork matched the main session's cached prefix only through the system prompt (Claude Code places the history cache breakpoint on a message the reconstruction lacks), so expect the fork to process the full history as uncached input; no cost saving is claimed. The bridge refuses the fork, and the session falls back to synchronous nudges, when its `provider.strictMcpConfig` is off (external MCP tools could load) or when an `@file` expansion in the main Claude Code session cannot be carried into the fork; the refusal reason is logged as `bridge-fork-declined`. A bridge without this capability never accepts, and the session falls back to synchronous nudges (`bridge-fork-unavailable`).
   - A fork result that would refold an inline-restored block **in place** (same block id, new summary) is rejected as a whole and the next nudge goes synchronous: the kernel keeps the block's original `compressCallId` on such a refold, so the async record could not be matched to it again. Record recovery applies the same guard and never overwrites a newer block.
+
+### `compress.asyncClaudeBridge`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** 🟢 ACTIVE (experimental)
+- **Description:** Separate opt-in for async compression on the `claude-bridge` wire. On `claude-bridge`, async runs only when **both** `compress.async` and `compress.asyncClaudeBridge` resolve to the literal `true`. Both resolve through the same `models > providers > global` cascade as every other `compress.*` field. Other wires ignore this field.
+
+  **Why a second switch:** the bridge fork rebuilds the conversation into a throwaway Claude Code session. In an offline capture it shared only the system-prompt cache with the main session, so it may process the full history as uncached input and cost more than a synchronous compression request ([pi-claude-bridge #161](https://github.com/elidickinson/pi-claude-bridge/issues/161)). Enabling `compress.async` alone does not accept that risk.
+
+  With `compress.async: true` and this field off, `claude-bridge` sessions keep synchronous nudges. This is not treated as a failure: ACP logs `bridge-async-not-enabled` once per session and shows no fallback notice. Turning the field off while a bridge fork is running or its result is pending aborts the fork and discards the result, the same as turning `compress.async` off. A non-boolean value logs `compress-async-claude-bridge-invalid` (value type only) and counts as off.
+
+  **Draft testers:** `compress.async: true` used to enable the bridge too. Add this field to keep bridge async:
+
+  ```json
+  { "compress": { "async": true, "asyncClaudeBridge": true } }
+  ```
+
+  Or scope it to the bridge provider only:
+
+  ```json
+  { "compress": { "async": true, "providers": { "claude-bridge": { "asyncClaudeBridge": true } } } }
+  ```
 
 ### Soft target with elastic headroom (#1122)
 

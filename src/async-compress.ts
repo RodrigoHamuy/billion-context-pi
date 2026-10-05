@@ -15,6 +15,7 @@ export const ASYNC_FORK_TIMEOUT_MS = 5 * 60_000;
 export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses", "claude-bridge"]);
 // No request body to replay: the provider runs the fork itself over pi.events (pi-claude-bridge isolated-fork).
 const BRIDGE_FORK_APIS: ReadonlySet<string> = new Set(["claude-bridge"]);
+export const isBridgeForkApi = (api: unknown): boolean => BRIDGE_FORK_APIS.has(String(api));
 export const BRIDGE_FORK_CHANNEL = "claude-bridge:isolated-fork";
 const RESPONSES_APIS: ReadonlySet<string> = new Set(["openai-responses", "openai-codex-responses"]);
 
@@ -228,6 +229,10 @@ export class AsyncCompressor {
 
   isActive(sid: string): boolean {
     return this.jobs.has(sid);
+  }
+
+  jobApi(sid: string): string | undefined {
+    return this.jobs.get(sid)?.api;
   }
 
   fallbackReason(sid: string): string | undefined {
