@@ -423,6 +423,13 @@ function wireAsyncCompress(pi: ExtensionAPI, runtime: AcpRuntime, asyncCompress:
     if (runtime.refused) return;
     asyncCompress.onResponse(ctx.sessionManager.getSessionId(), event.status, ctx);
   });
+  // Codex main requests over WebSocket never fire after_provider_response; the stream start is their launch signal.
+  pi.on("message_start", (event, ctx) => {
+    if (runtime.refused) return;
+    const msg = event.message;
+    if (msg.role !== "assistant" || msg.stopReason === "error" || msg.stopReason === "aborted") return;
+    asyncCompress.onStreamStart(ctx.sessionManager.getSessionId(), ctx);
+  });
   pi.on("message_end", (event, ctx) => {
     const msg = event.message;
     if (msg.role !== "assistant" || (msg.stopReason !== "error" && msg.stopReason !== "aborted")) return;

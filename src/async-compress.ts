@@ -12,7 +12,8 @@ import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE } from "./messages.js"
 export { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE };
 
 export const ASYNC_FORK_TIMEOUT_MS = 5 * 60_000;
-export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses"]);
+export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses"]);
+const RESPONSES_APIS: ReadonlySet<string> = new Set(["openai-responses", "openai-codex-responses"]);
 
 const SERVER_STATE_KEYS = ["previous_response_id", "conversation", "context_management"];
 
@@ -108,7 +109,7 @@ export function unsupportedPayloadReason(api: string, payload: unknown): string 
   if (!ASYNC_SUPPORTED_APIS.has(api)) return `unsupported-api:${api}`;
   if (!isRecord(payload)) return "payload-not-object";
   for (const key of SERVER_STATE_KEYS) if (key in payload) return `server-state:${key}`;
-  const list = api === "openai-responses" ? payload.input : payload.messages;
+  const list = RESPONSES_APIS.has(api) ? payload.input : payload.messages;
   if (!Array.isArray(list) || list.length === 0) return "payload-shape";
   return null;
 }
@@ -117,7 +118,7 @@ export function forkPayload(api: string, payload: unknown, nudgeText: string): u
   const reason = unsupportedPayloadReason(api, payload);
   if (reason !== null || !isRecord(payload)) throw new Error(reason ?? "payload-not-object");
   const body = structuredClone(payload);
-  if (api === "openai-responses") {
+  if (RESPONSES_APIS.has(api)) {
     body.input = [...(body.input as unknown[]), { role: "user", content: [{ type: "input_text", text: nudgeText }] }];
   } else {
     body.messages = [...(body.messages as unknown[]), { role: "user", content: [{ type: "text", text: nudgeText }] }];
@@ -280,6 +281,15 @@ export class AsyncCompressor {
       this.abandon(job, `main-request-status:${status}`, true);
       return;
     }
+    this.launch(job, ctx);
+  }
+
+  onStreamStart(sid: string, ctx: ExtensionContext): void {
+    const job = this.jobs.get(sid);
+    if (job && job.phase === "awaiting-response" && job.api === "openai-codex-responses") this.launch(job, ctx);
+  }
+
+  private launch(job: Job, ctx: ExtensionContext): void {
     job.phase = "running";
     void this.run(job, ctx);
   }
@@ -407,6 +417,8 @@ export class AsyncCompressor {
       sessionId: job.sid,
       signal: job.controller.signal,
       onPayload: () => payload,
+      // Codex WebSockets are cached per session id with continuation state; the fork must not share them.
+      ...(job.api === "openai-codex-responses" ? { transport: "sse" as const } : {}),
       ...(job.thinkingLevel !== "off" ? { reasoning: job.thinkingLevel } : {}),
     };
     const requestModel = auth?.auth.baseUrl ? { ...job.model, baseUrl: auth.auth.baseUrl } : job.model;

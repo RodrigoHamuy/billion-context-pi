@@ -46,7 +46,10 @@ test("forkPayload appends exactly one native user turn per supported wire and ne
 
 test("unsupportedPayloadReason: unsupported wires and server-side conversation state fail closed", () => {
   assert.equal(unsupportedPayloadReason("google-generative-ai", { contents: [] }), "unsupported-api:google-generative-ai");
-  assert.equal(unsupportedPayloadReason("openai-codex-responses", { input: [1] }), "unsupported-api:openai-codex-responses");
+  assert.equal(unsupportedPayloadReason("azure-openai-responses", { input: [1] }), "unsupported-api:azure-openai-responses");
+  assert.equal(unsupportedPayloadReason("openai-codex-responses", { input: [1], store: false }), null);
+  assert.equal(unsupportedPayloadReason("openai-codex-responses", { input: [1], previous_response_id: "r" }), "server-state:previous_response_id");
+  assert.deepEqual((forkPayload("openai-codex-responses", { input: [{ role: "user", content: "a" }] }, "N") as { input: unknown[] }).input[1], { role: "user", content: [{ type: "input_text", text: "N" }] });
   assert.equal(unsupportedPayloadReason("openai-responses", { input: [1], previous_response_id: "r" }), "server-state:previous_response_id");
   assert.equal(unsupportedPayloadReason("openai-responses", { input: [1], conversation: "c" }), "server-state:conversation");
   assert.equal(unsupportedPayloadReason("anthropic-messages", { messages: [1], context_management: {} }), "server-state:context_management");

@@ -710,13 +710,14 @@
   4. 在下一个请求边界（下一个 `context` 事件，持有会话锁）对结果做校验：fork 看到的历史必须仍是当前视图的精确前缀、引用的 ref 必须绑定到同一消息、活跃 block 集合不变（例如期间没有落地其他 compress）。然后经过与 `compress` 工具相同的内核校验，**全有或全无**地应用。过期或无效的结果直接丢弃，实时状态不受影响。
   5. 成功时先向会话日志追加一条只读的 `acp-async-compress` 记录，**然后**才采用新状态（记录写不进去则丢弃结果）。该记录保存已应用的 range，`.acp.json` sidecar 丢失时可按日志顺序与普通 compress 调用一起重放重建；若只是 sidecar 写入丢失（记录存在、已有 sidecar 缺该 block），下一次加载会基于当前视图重新应用该记录。block 摘要以稳定的 user 角色检查点出现在 block 位置（`[Compressed conversation section] … [ACP async compression: bN=mA–mB]`）；对 `bN` 的再折叠与 decompress 与普通 block 相同。
 
-  **仍走同步：** 紧急 nudge；nudge 不是请求最后一条消息时；fork 进行中时后续非紧急 nudge 暂缓。**适用范围：** 仅 Pi 宿主；协议 `anthropic-messages`、`openai-completions`、`openai-responses`；且无服务端会话状态（`previous_response_id` / `conversation` / `context_management`）。其他情况、fork 请求失败、fork 输出无效、5 分钟 fork 超时、或记录写入失败，都会让该会话回退到同步 nudge（每会话一条提示）。会话切换 / fork / 树导航 / 压缩（compaction）/ 切换模型 / 关闭，或用户中止主请求，都会中止进行中的 fork；关闭 `compress.async` 会丢弃待应用的结果。代理 / native 让位以及被拒绝的宿主上该功能不生效。
+  **仍走同步：** 紧急 nudge；nudge 不是请求最后一条消息时；fork 进行中时后续非紧急 nudge 暂缓。**适用范围：** 仅 Pi 宿主；协议 `anthropic-messages`、`openai-completions`、`openai-responses`、`openai-codex-responses`（ChatGPT/Codex 登录）；且无服务端会话状态（`previous_response_id` / `conversation` / `context_management`）。其他情况、fork 请求失败、fork 输出无效、5 分钟 fork 超时、或记录写入失败，都会让该会话回退到同步 nudge（每会话一条提示）。会话切换 / fork / 树导航 / 压缩（compaction）/ 切换模型 / 关闭，或用户中止主请求，都会中止进行中的 fork；关闭 `compress.async` 会丢弃待应用的结果。代理 / native 让位以及被拒绝的宿主上该功能不生效。
 
   **限制：**
   - fork 复用的是 **ACP 的 `before_provider_request` 处理器所看到的** provider 载荷。Pi 允许后加载的扩展*替换*该载荷，而这种替换对扩展不可见；存在此类扩展时，fork 读到的字节可能与主请求不同（缓存未命中，摘要可能涉及主 agent 未看到的内容）。后续 `before_provider_headers` 处理器原地修改的请求头*会*被包含。校验证明的是历史结构与 ref，而不是摘要忠实于 ACP 从未见过的字节。
   - fork 的用量写入 ACP 日志（`event=fork-finished`，含 input / output / cacheRead / cacheWrite），但**不**计入 Pi 的会话费用统计。
   - Anthropic：fork 保留主请求的缓存断点（因此前缀为缓存读取）；同步请求则会把该断点移到 nudge 上。
   - 基于环境变量认证的 provider（Bedrock、Vertex）目前属于不支持的协议，保持同步。
+  - Codex（`openai-codex-responses`）：即使主 agent 使用 Codex WebSocket，fork 也始终走 HTTP/SSE，因此绝不共用主 socket 及其 `previous_response_id` 续接状态。fork 发送相同的 `prompt_cache_key` 和会话 id，OAuth token 在 fork 时经 Pi 的 provider 鉴权获取（临近过期会刷新）。主请求仍在流式输出时后端能否让 fork 的前缀命中缓存，尚未验证。
   - 若 fork 结果会对已内联还原的 block 做**原地**再折叠（同一 block id、新摘要），整批拒绝，下一次 nudge 走同步：内核在原地再折叠时保留 block 原来的 `compressCallId`，异步记录将无法再与其对应。记录恢复同样带此保护，绝不覆盖更新的 block。
 
 ### 软目标与弹性余量 (#1122)

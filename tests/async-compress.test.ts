@@ -282,6 +282,37 @@ test("emergency nudges stay synchronous even with compress.async", async () => {
   assert.equal(h.forkCalls.length, 0);
 });
 
+test("Codex stream-start launch: assistant message_start launches once; user/error/aborted starts do not", async () => {
+  const h = await harness("stream-start");
+  (h.ctx.model as { api: string }).api = "openai-codex-responses";
+  await h.emit("context", { messages: [] });
+  await h.emit("before_provider_headers", { headers: { "x-session": "abc" } });
+  await h.emit("before_provider_request", { payload: { model: "test-model", store: false, input: [{ role: "user", content: "history" }] } });
+  await h.emit("message_start", { message: { role: "user", content: "hi", timestamp: 1 } });
+  await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "error", timestamp: 1 } });
+  await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "aborted", timestamp: 1 } });
+  await flush();
+  assert.equal(h.forkCalls.length, 0, "no launch before a successful stream start");
+  await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "stop", timestamp: 1 } });
+  await h.emit("after_provider_response", { status: 200, headers: {} });
+  await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "stop", timestamp: 1 } });
+  await flush();
+  assert.equal(h.forkCalls.length, 1, "launched exactly once");
+});
+
+test("non-Codex wires launch only from after_provider_response, never from message_start", async () => {
+  const h = await harness("http-then-start");
+  await h.emit("context", { messages: [] });
+  await h.emit("before_provider_headers", { headers: { "x-session": "abc" } });
+  await h.emit("before_provider_request", { payload: MAIN_PAYLOAD });
+  await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "stop", timestamp: 1 } });
+  await flush();
+  assert.equal(h.forkCalls.length, 0);
+  await h.emit("after_provider_response", { status: 200, headers: {} });
+  await flush();
+  assert.equal(h.forkCalls.length, 1);
+});
+
 test("unsupported api falls back to sync nudges", async () => {
   const h = await harness("unsupported-api");
   (h.ctx.model as { api: string }).api = "google-generative-ai";
