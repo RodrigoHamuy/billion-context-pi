@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, createEventBus } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
-import { AsyncCompressor, BRIDGE_FORK_CHANNEL, BRIDGE_FORK_DIRECTIVE, bridgeForkMessage, takeSnapshot } from "../src/async-compress.js";
+import { AsyncCompressor, BRIDGE_FORK_CHANNEL, ASYNC_FORK_DIRECTIVE, bridgeForkMessage, takeSnapshot } from "../src/async-compress.js";
 import { createAcpExtension } from "../src/index.js";
 import { setRunNpmForTest } from "../src/update.js";
 import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE, ACP_NUDGE_CUSTOM_TYPE } from "../src/messages.js";
@@ -36,7 +36,7 @@ const MODEL = { api: "claude-bridge", provider: "claude-bridge", id: "claude-opu
 const ARGS = { content: [{ startId: "m00001", endId: "m00002", summary: "greeting exchanged", topic: "greeting" }] };
 const USAGE = { input: 1000, output: 20, cacheRead: 900, cacheWrite: 0 };
 
-type Req = { version: number; piSessionId: string; prompt: string; captureTool: string; signal: AbortSignal; accept(result: unknown): boolean };
+type Req = { version: number; piSessionId: string; prompt: string; captureTool: string; cutAfterToolResult?: string; signal: AbortSignal; accept(result: unknown): boolean };
 
 function harness(sid: string, timeoutMs?: number) {
   const bus = createEventBus();
@@ -49,7 +49,7 @@ function harness(sid: string, timeoutMs?: number) {
   } as unknown as ExtensionContext;
   const pi = { appendEntry: () => {}, getThinkingLevel: () => "high", getActiveTools: () => [], getAllTools: () => [], events: bus } as unknown as ConstructorParameters<typeof AsyncCompressor>[0]["pi"];
   const c = new AsyncCompressor({ pi, ...(timeoutMs ? { timeoutMs } : {}) });
-  c.start(sid, { nudgeText: "NUDGE", snapshot: takeSnapshot([], createInitialState()), model: MODEL });
+  c.start(sid, { nudgeText: "NUDGE", snapshot: takeSnapshot([], createInitialState()), model: MODEL, triggerCallId: "toolu_trigger" });
   return { bus, ctx, c, notes };
 }
 
@@ -80,7 +80,7 @@ test("claude-bridge: no provider capture; launches from stream start with the ex
   c.onStreamStart("bridge-ok", ctx);
   assert.equal(seen.length, 1, "requested in the stream-start tick");
   const r = seen[0]!;
-  assert.deepEqual({ version: r.version, piSessionId: r.piSessionId, prompt: r.prompt, captureTool: r.captureTool }, { version: 1, piSessionId: "bridge-ok", prompt: `${BRIDGE_FORK_DIRECTIVE}\n\nNUDGE`, captureTool: "compress" }, "the fork is told to compress only, ahead of the same nudge the sync path shows");
+  assert.deepEqual({ version: r.version, piSessionId: r.piSessionId, prompt: r.prompt, captureTool: r.captureTool, cutAfterToolResult: r.cutAfterToolResult }, { version: 1, piSessionId: "bridge-ok", prompt: `${ASYNC_FORK_DIRECTIVE}\n\nNUDGE`, captureTool: "compress", cutAfterToolResult: "toolu_trigger" }, "the fork is cut after the trigger's result and told to compress only, ahead of the nudge");
   assert.ok(r.signal instanceof AbortSignal);
   await waitFor(() => c.phase("bridge-ok") === "ready");
   const ready = c.takeReady("bridge-ok")!;
@@ -160,13 +160,13 @@ test("claude-bridge: no bridge listener (or a non-promise accept) fails closed t
   assert.equal(bogus.c.fallbackReason("bridge-bogus"), "bridge-fork-unavailable");
 });
 
-test("claude-bridge: no-capture is discarded like a fork without a compress call; a malformed result falls back", async () => {
+test("claude-bridge: no-capture is discarded like a fork without a compress call and owes main the sync nudge; a malformed result falls back", async () => {
   const quiet = harness("bridge-quiet");
   quiet.bus.on(BRIDGE_FORK_CHANNEL, (data) => (data as Req).accept(Promise.resolve({ ok: false, reason: "no-capture", usage: USAGE })));
   quiet.c.onStreamStart("bridge-quiet", quiet.ctx);
   await waitFor(() => !quiet.c.isActive("bridge-quiet"));
   assert.equal(quiet.c.fallbackReason("bridge-quiet"), undefined);
-  assert.equal(quiet.c.takeSyncRetry("bridge-quiet"), false);
+  assert.equal(quiet.c.takeSyncRetry("bridge-quiet"), true, "main asked for compression, so the nudge comes back synchronously");
 
   const bad = harness("bridge-bad");
   bad.bus.on(BRIDGE_FORK_CHANNEL, (data) => (data as Req).accept(Promise.resolve({ ok: true, args: "not-an-object" })));
@@ -184,7 +184,7 @@ test("claude-bridge: a transient decline retries this nudge synchronously and ke
     h.c.onStreamStart(sid, h.ctx);
     await waitFor(() => !h.c.isActive(sid) || h.c.phase(sid) === "ready");
   };
-  const restart = () => h.c.start(sid, { nudgeText: "NUDGE", snapshot: takeSnapshot([], createInitialState()), model: MODEL });
+  const restart = () => h.c.start(sid, { nudgeText: "NUDGE", snapshot: takeSnapshot([], createInitialState()), model: MODEL, triggerCallId: "toolu_trigger" });
 
   await round();
   assert.equal(h.c.fallbackReason(sid), undefined, "one decline does not turn async off");
@@ -196,6 +196,17 @@ test("claude-bridge: a transient decline retries this nudge synchronously and ke
   await round();
   assert.equal(h.c.fallbackReason(sid), undefined);
   assert.equal(h.c.takeSyncRetry(sid), true);
+
+  reply = { ok: true, args: ARGS, usage: USAGE };
+  restart();
+  await round();
+  assert.ok(h.c.takeReady(sid));
+  reply = { ok: false, reason: "cut-timeout" };
+  restart();
+  await round();
+  assert.equal(h.c.fallbackReason(sid), undefined, "a cut that never reached the transcript in time is transient too");
+  assert.equal(h.c.takeSyncRetry(sid), true);
+  assert.equal(h.c.takeRetryReason(sid), "bridge-declined:cut-timeout");
 
   reply = { ok: true, args: ARGS, usage: USAGE };
   restart();
@@ -266,7 +277,7 @@ function entry(id: string, role: string, text: string) {
     : { role, content: text, timestamp: 1 } };
 }
 
-test("claude-bridge main: real Agent turn over pi.events forks the request being served; result applies at the next boundary", async () => {
+test("claude-bridge main: real Agent turn queues with compress([]); the bridge is asked to fork the next served request after the queued result; result applies at the next boundary", async () => {
   const { Agent } = (await import(AGENT_CORE)) as { Agent: new (opts: Record<string, unknown>) => { prompt(text: string): Promise<void>; subscribe(fn: (e: { type: string }) => unknown): () => void } };
   const { createAssistantMessageEventStream } = (await import(PI_AI + "utils/event-stream.js")) as { createAssistantMessageEventStream(): { push(e: unknown): void; end(): void } };
   const sid = "bridge-agent";
@@ -286,12 +297,13 @@ test("claude-bridge main: real Agent turn over pi.events forks the request being
     r.accept(Promise.resolve({ ok: true, args: forkArgs, usage: USAGE }));
   });
   const handlers = new Map<string, Handler[]>();
+  const tools = new Map<string, { name: string; label: string; description: string; parameters: unknown; execute: (...a: unknown[]) => Promise<unknown> }>();
   const appended: Array<{ customType: string; data?: unknown }> = [];
   let entries: unknown[] = [entry("u0", "user", "start " + MID)];
   for (let i = 1; i < 40; i++) entries.push(entry(`e${i}`, i % 2 ? "assistant" : "user", `turn ${i} ` + MID));
   const pi = {
     on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
-    registerTool() {},
+    registerTool(tool: never) { tools.set((tool as { name: string }).name, tool); },
     registerCommand() {},
     registerEntryRenderer() {},
     appendEntry(customType: string, data?: unknown) {
@@ -322,33 +334,49 @@ test("claude-bridge main: real Agent turn over pi.events forks the request being
   };
   const nudges = () => appended.filter((a) => a.customType === ACP_NUDGE_CUSTOM_TYPE).length;
   for (let i = 0; i < 3 && nudges() === 0; i++) await emit("context", { messages: [] });
-  assert.equal(nudges(), 1, "nudge decided and handed to the async path");
+  assert.equal(nudges(), 1, "nudge decided");
 
+  const compress = tools.get("compress")!;
+  const agentTool = { name: compress.name, label: compress.label, description: compress.description, parameters: compress.parameters, execute: (id: unknown, params: unknown, signal: unknown, onUpdate: unknown) => compress.execute(id, params, signal, onUpdate, ctx) };
+  const TRIGGER = "toolu_trigger";
+  let calls = 0;
   const agent = new Agent({
-    initialState: { systemPrompt: "SYS", model, thinkingLevel: "off", tools: [] },
+    initialState: { systemPrompt: "SYS", model, thinkingLevel: "off", tools: [agentTool] },
     convertToLlm,
     sessionId: sid,
     transformContext: async (messages: unknown[]) => ((await emit("context", { messages })) as { messages?: unknown[] } | undefined)?.messages ?? messages,
     streamFn: (_m: unknown, context: { messages: unknown[] }) => {
       lastServed = { messages: [...context.messages] };
+      const first = calls++ === 0;
       const stream = createAssistantMessageEventStream();
-      const partial = { role: "assistant", content: [], api: "claude-bridge", provider: "claude-bridge", model: "claude-opus-5-5", usage: USAGE0, stopReason: "stop", timestamp: Date.now() };
+      const partial = { role: "assistant", content: [], api: "claude-bridge", provider: "claude-bridge", model: "claude-opus-5-5", usage: USAGE0, stopReason: first ? "toolUse" : "stop", timestamp: Date.now() };
       setTimeout(() => {
         stream.push({ type: "start", partial });
-        const message = { ...partial, content: [{ type: "text", text: "ok" }] };
-        stream.push({ type: "done", reason: "stop", message });
+        const message = { ...partial, content: first ? [{ type: "toolCall", id: TRIGGER, name: "compress", arguments: { content: [] } }] : [{ type: "text", text: "ok" }] };
+        stream.push({ type: "done", reason: first ? "toolUse" : "stop", message });
         stream.end();
       }, 5);
       return stream;
     },
   });
-  agent.subscribe(async (e) => { if (["message_start", "message_end", "agent_end"].includes(e.type)) await emit(e.type, e); });
+  // pi persists each finished message before the next request is built.
+  agent.subscribe(async (e) => {
+    if (e.type === "message_end") entries = [...entries, { type: "message", id: `p${entries.length}`, parentId: null, timestamp: "", message: (e as unknown as { message: unknown }).message }];
+    if (["message_start", "message_end", "agent_end"].includes(e.type)) await emit(e.type, e);
+  });
   await agent.prompt("go");
 
-  assert.equal(requests.length, 1, "one fork request for the nudged turn");
+  assert.equal(calls, 2, "main asked once, got the queued result, and answered");
+  assert.equal(requests.length, 1, "one fork request, for the request after the trigger");
   assert.equal(servedAtAccept[0], lastServed, "accepted while the bridge's last served request was the turn being streamed");
-  assert.ok(requests[0]!.prompt.startsWith(`${BRIDGE_FORK_DIRECTIVE}\n\n`));
-  assert.ok(requests[0]!.prompt.length > BRIDGE_FORK_DIRECTIVE.length + 2, "the nudge follows the directive");
+  const served = lastServed!.messages as Array<{ role: string; toolCallId?: string; content: unknown }>;
+  const result = served[served.length - 1]!;
+  assert.equal(result.role, "toolResult");
+  assert.equal(result.toolCallId, TRIGGER);
+  assert.match(JSON.stringify(result.content), /Background compression queued/, "the served request carries the queued result");
+  assert.equal(requests[0]!.cutAfterToolResult, TRIGGER, "the bridge cuts right after it");
+  assert.ok(requests[0]!.prompt.startsWith(`${ASYNC_FORK_DIRECTIVE}\n\n`));
+  assert.ok(requests[0]!.prompt.length > ASYNC_FORK_DIRECTIVE.length + 2, "the nudge follows the directive");
   await waitFor(() => logged(sid, "result-ready"));
 
   const r = (await emit("context", { messages: [] })) as { messages: Array<{ role: string; content: unknown }> };

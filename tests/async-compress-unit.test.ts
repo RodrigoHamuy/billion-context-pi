@@ -17,6 +17,12 @@ import { coreOutToAgentMessages, entriesToCoreMessages, ASYNC_COMPRESS_CUSTOM_TY
 import { rebuildStateFromLog, hasCompressHistory } from "../src/state-rebuild.js";
 import { sanitizeSummary } from "../src/summary-sanitize.js";
 
+const TRIGGER_PAYLOAD = { messages: [
+  { role: "user", content: "x" },
+  { role: "assistant", content: [{ type: "tool_use", id: "trig", name: "compress", input: { content: [] } }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "trig", content: "queued" }] },
+] };
+
 const TEXT = "lorem ipsum dolor sit amet ".repeat(200);
 const SUMMARY = "older turns: repeated lorem ipsum exchanges between user and assistant, nothing decided";
 
@@ -186,8 +192,8 @@ test("AsyncCompressor: 5-minute style hard timeout aborts the fork and falls bac
   } as unknown as ExtensionContext;
   const pi = { appendEntry: () => {}, getThinkingLevel: () => "high", getActiveTools: () => [], getAllTools: () => [] } as unknown as ConstructorParameters<typeof AsyncCompressor>[0]["pi"];
   const c = new AsyncCompressor({ pi, timeoutMs: 30 });
-  c.start("timeout", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: { api: "anthropic-messages", provider: "anthropic", id: "m" } as unknown as NonNullable<ExtensionContext["model"]> });
-  c.onPayload("timeout", { messages: [{ role: "user", content: "x" }] }, ctx);
+  c.start("timeout", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: { api: "anthropic-messages", provider: "anthropic", id: "m" } as unknown as NonNullable<ExtensionContext["model"]>, triggerCallId: "trig" });
+  c.onPayload("timeout", TRIGGER_PAYLOAD, ctx);
   c.onResponse("timeout", 200, ctx);
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(aborted, true);
@@ -220,8 +226,8 @@ async function readyCompressor(sid: string, ranges: unknown, snapshot: ReturnTyp
   } as unknown as ExtensionContext;
   const pi = { appendEntry: () => {}, getThinkingLevel: () => "off", getActiveTools: () => [], getAllTools: () => [] } as unknown as ConstructorParameters<typeof AsyncCompressor>[0]["pi"];
   const c = new AsyncCompressor({ pi });
-  c.start(sid, { nudgeText: "n", snapshot, model: ctx.model! });
-  c.onPayload(sid, { messages: [{ role: "user", content: "x" }] }, ctx);
+  c.start(sid, { nudgeText: "n", snapshot, model: ctx.model!, triggerCallId: "trig" });
+  c.onPayload(sid, TRIGGER_PAYLOAD, ctx);
   c.onResponse(sid, 200, ctx);
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(c.phase(sid), "ready");
@@ -280,8 +286,8 @@ test("deadline settles the coordinator even when auth/provider never settle and 
   const never = new Promise<never>(() => {});
   const ctx = bareCtx("never", { getProvider: () => ({ streamSimple: () => ({ result: () => never }) }), getProviderAuth: () => never });
   const c = new AsyncCompressor({ pi: barePi, timeoutMs: 25 });
-  c.start("never", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel });
-  c.onPayload("never", { messages: [{ role: "user", content: "x" }] }, ctx);
+  c.start("never", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel, triggerCallId: "trig" });
+  c.onPayload("never", TRIGGER_PAYLOAD, ctx);
   c.onResponse("never", 200, ctx);
   assert.equal(c.phase("never"), "running");
   await new Promise((r) => setTimeout(r, 70));
@@ -300,8 +306,8 @@ test("fork errors are logged without their message (provider text can carry cred
     const secret = "sk-live-SECRET-123 x-api-key: hunter2";
     const ctx = bareCtx("redact", { getProvider: () => ({ streamSimple: () => ({ result: async () => { throw new Error(`401 Unauthorized ${secret}`); } }) }), getProviderAuth: async () => ({ auth: { apiKey: "sk-live-SECRET-123" } }) });
     const c = new AsyncCompressor({ pi: barePi });
-    c.start("redact", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel });
-    c.onPayload("redact", { messages: [{ role: "user", content: "x" }] }, ctx);
+    c.start("redact", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel, triggerCallId: "trig" });
+    c.onPayload("redact", TRIGGER_PAYLOAD, ctx);
     c.onResponse("redact", 200, ctx);
     await new Promise((r) => setTimeout(r, 20));
     const log = await readFile(join(dir, "acp.log"), "utf8");
@@ -322,10 +328,10 @@ test("model and tool definitions are frozen when the job starts", async () => {
   const pi = { appendEntry: () => {}, getThinkingLevel: () => "off", getActiveTools: () => active, getAllTools: () => [{ name: "compress", description: "c", parameters: {} }, { name: "bash", description: "b", parameters: {} }] } as unknown as ConstructorParameters<typeof AsyncCompressor>[0]["pi"];
   const model = { api: "anthropic-messages", provider: "anthropic", id: "m-original" };
   const c = new AsyncCompressor({ pi });
-  c.start("frozen", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]> });
+  c.start("frozen", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]>, triggerCallId: "trig" });
   model.id = "m-mutated";
   active = ["bash"];
-  c.onPayload("frozen", { messages: [{ role: "user", content: "x" }] }, ctx);
+  c.onPayload("frozen", TRIGGER_PAYLOAD, ctx);
   c.onResponse("frozen", 200, ctx);
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(seen.model?.id, "m-original");
@@ -434,8 +440,8 @@ test("auth resolving after cancellation never starts the transport", async () =>
     getProviderAuth: () => new Promise((r) => { resolveAuth = r; }),
   });
   const c = new AsyncCompressor({ pi: barePi });
-  c.start("late-auth", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel });
-  c.onPayload("late-auth", { messages: [{ role: "user", content: "x" }] }, ctx);
+  c.start("late-auth", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel, triggerCallId: "trig" });
+  c.onPayload("late-auth", TRIGGER_PAYLOAD, ctx);
   c.onResponse("late-auth", 200, ctx);
   await new Promise((r) => setTimeout(r, 5));
   c.cancel("late-auth", "session-switch");
@@ -450,12 +456,71 @@ test("auth resolving after cancellation never starts the transport", async () =>
     getProviderAuth: () => new Promise((r) => { resolveAuth2 = r; }),
   });
   const c2 = new AsyncCompressor({ pi: barePi, timeoutMs: 15 });
-  c2.start("late-auth-timeout", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel });
-  c2.onPayload("late-auth-timeout", { messages: [{ role: "user", content: "x" }] }, ctx2);
+  c2.start("late-auth-timeout", { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel, triggerCallId: "trig" });
+  c2.onPayload("late-auth-timeout", TRIGGER_PAYLOAD, ctx2);
   c2.onResponse("late-auth-timeout", 200, ctx2);
   await new Promise((r) => setTimeout(r, 40));
   assert.equal(c2.fallbackReason("late-auth-timeout"), "fork-timeout");
   resolveAuth2({ auth: { apiKey: "k" } });
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(started2, false, "late auth after the deadline does not start the transport");
+});
+
+// The main agent was told "queued": every way a job ends without applying owes
+// exactly one sync nudge, with the reason; only a sync fold, a replacing job or
+// a session reset owe none.
+test("every exit of an accepted job that does not apply owes one sync retry with its reason", async () => {
+  const forkReply = (reply: () => Promise<unknown>) => ({ getProvider: () => ({ streamSimple: () => ({ result: reply }) }), getProviderAuth: async () => undefined });
+  const never = new Promise<never>(() => {});
+  async function exit(name: string, registry: Record<string, unknown>, drive: (c: AsyncCompressor, ctx: ExtensionContext) => void | Promise<void>, timeoutMs = 1_000) {
+    const ctx = bareCtx(name, registry);
+    const c = new AsyncCompressor({ pi: barePi, timeoutMs });
+    c.start(name, { nudgeText: "n", snapshot: takeSnapshot([], createInitialState()), model: anthropicModel, triggerCallId: "trig" });
+    await drive(c, ctx);
+    await new Promise((r) => setTimeout(r, 40));
+    const out = { active: c.isActive(name), retry: c.takeSyncRetry(name), reason: c.takeRetryReason(name), again: c.takeSyncRetry(name) };
+    c.resetSession(name);
+    return out;
+  }
+  const launched = (c: AsyncCompressor, ctx: ExtensionContext) => { c.onPayload(ctx.sessionManager.getSessionId(), TRIGGER_PAYLOAD, ctx); c.onResponse(ctx.sessionManager.getSessionId(), 200, ctx); };
+  const cases: Array<[string, Record<string, unknown>, (c: AsyncCompressor, ctx: ExtensionContext) => void | Promise<void>, string, number?]> = [
+    ["timeout", forkReply(() => never), launched, "fork-timeout", 15],
+    ["threw", forkReply(async () => { throw new Error("boom"); }), launched, "fork-threw"],
+    ["error", forkReply(async () => ({ role: "assistant", content: [], stopReason: "error" })), launched, "fork-error"],
+    ["invalid-args", forkReply(async () => ({ role: "assistant", content: [{ type: "toolCall", id: "t", name: "compress", arguments: { content: "garbage" } }], stopReason: "toolUse" })), launched, "fork-invalid-args"],
+    ["no-call", forkReply(async () => ({ role: "assistant", content: [{ type: "text", text: "no" }], stopReason: "stop" })), launched, "fork-no-compress-call"],
+    ["unsupported-capture", forkReply(() => never), (c, ctx) => c.onPayload("unsupported-capture", { ...TRIGGER_PAYLOAD, context_management: {} }, ctx), "capture:"],
+    ["trigger-missing", forkReply(() => never), (c, ctx) => c.onPayload("trigger-missing", { messages: [{ role: "user", content: "x" }] }, ctx), "capture:trigger-missing"],
+    ["main-429", forkReply(() => never), (c, ctx) => { c.onPayload("main-429", TRIGGER_PAYLOAD, ctx); c.onResponse("main-429", 429, ctx); }, "main-request-status:429"],
+    ["main-aborted-running", forkReply(() => never), (c, ctx) => { launched(c, ctx); c.onMainFailed("main-aborted-running", "main-aborted", true); }, "main-aborted"],
+    ["model-select", forkReply(() => never), (c) => c.cancel("model-select", "model-select"), "model-select"],
+  ];
+  for (const [name, registry, drive, reason, timeoutMs] of cases) {
+    const out = await exit(name, registry, drive, timeoutMs);
+    assert.equal(out.active, false, name);
+    assert.equal(out.retry, true, `${name} owes a sync retry`);
+    assert.ok(out.reason?.startsWith(reason), `${name}: reason ${out.reason}`);
+    assert.equal(out.again, false, `${name}: owed once`);
+  }
+  for (const reason of ["superseded-by-sync-compress", "session-reset"]) {
+    const out = await exit(`no-retry-${reason}`, forkReply(() => never), (c) => c.cancel(`no-retry-${reason}`, reason));
+    assert.equal(out.retry, false, `${reason} owes nothing`);
+  }
+  const pending = new AsyncCompressor({ pi: barePi });
+  pending.trigger("trigger-only", "trig");
+  pending.cancel("trigger-only", "session-tree");
+  assert.equal(pending.takeSyncRetry("trigger-only"), true, "a trigger cancelled before its job started owes the retry too");
+});
+
+test("apply-time failures owe one sync retry: invalid result and record append failure", async () => {
+  const { applyReadyAsyncResult } = await import("../src/async-compress.js");
+  const { entries, view, state, snapshot } = snapshotFixture();
+  const bad = await readyCompressor("apply-invalid", [{ startId: "m00028", endId: "m00030", summary: SUMMARY }], snapshot);
+  await applyReadyAsyncResult({ compressor: bad.c, ctx: bad.ctx, core, config, view, state, entries: entries as never, enabled: true, pi: { appendEntry: () => {} } as never, save: async () => {} });
+  assert.equal(bad.c.takeSyncRetry("apply-invalid"), true);
+  assert.equal(bad.c.takeRetryReason("apply-invalid"), "result-invalid");
+  const lost = await readyCompressor("apply-append", [{ startId: "m00002", endId: "m00006", summary: SUMMARY }], snapshot);
+  await applyReadyAsyncResult({ compressor: lost.c, ctx: lost.ctx, core, config, view, state, entries: entries as never, enabled: true, pi: { appendEntry: () => { throw new Error("disk full"); } } as never, save: async () => {} });
+  assert.equal(lost.c.takeSyncRetry("apply-append"), true);
+  assert.equal(lost.c.takeRetryReason("apply-append"), "record-append-failed");
 });

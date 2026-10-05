@@ -12,19 +12,28 @@ import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE } from "./messages.js"
 export { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE };
 
 export const ASYNC_FORK_TIMEOUT_MS = 5 * 60_000;
+// Cancels that owe no sync nudge: main compressed itself, a newer job replaces
+// this one, or the session ended.
+const NO_RETRY_CANCELS: ReadonlySet<string> = new Set(["superseded-by-sync-compress", "superseded", "session-reset"]);
 export const ASYNC_SUPPORTED_APIS: ReadonlySet<string> = new Set(["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses", "claude-bridge"]);
 // No request body to replay: the provider runs the fork itself over pi.events (pi-claude-bridge isolated-fork).
 const BRIDGE_FORK_APIS: ReadonlySet<string> = new Set(["claude-bridge"]);
 // The bridge declines these before any model call: what the main session holds no
 // longer matches the request, or is not on disk yet. The next request nudges
 // synchronously; only a session that keeps declining stops trying async.
-const BRIDGE_TRANSIENT_DECLINES: ReadonlySet<string> = new Set(["stale-context", "unsupported-context"]);
+const BRIDGE_TRANSIENT_DECLINES: ReadonlySet<string> = new Set(["stale-context", "unsupported-context", "cut-timeout"]);
 const BRIDGE_DECLINE_LIMIT = 3;
 export const isBridgeForkApi = (api: unknown): boolean => BRIDGE_FORK_APIS.has(String(api));
 export const BRIDGE_FORK_CHANNEL = "claude-bridge:isolated-fork";
-// The bridge forks after the main turn's answer, so the fork's last message is
-// this prompt; the main session, not the fork, carries on with the user's task.
-export const BRIDGE_FORK_DIRECTIVE = "Background compression pass. The user's task is handled in the main conversation: do not continue or answer it, and do not call any tool other than `compress`. Make exactly one `compress` call, citing only message ids already shown above, as the context notice below describes.";
+// The fork's history ends at the main agent's compress({content: []}) call and
+// its "queued" result; the main session carries on with the user's task.
+export const ASYNC_FORK_DIRECTIVE = "Background compression pass, queued by the main conversation, which carries on with the user's task: do not continue or answer that task, and do not call any tool other than `compress`. Make exactly one `compress` call with non-empty `content`, citing only message ids already shown above, as the context notice below describes.";
+export const ASYNC_QUEUED_TEXT = "Background compression queued: a separate pass chooses the ranges and writes the summaries, and the result is applied at a later request. Continue the task; do not call compress for this again.";
+export const ASYNC_ALREADY_QUEUED_TEXT = "Background compression is already queued. Continue the task.";
+export const ASYNC_NOTHING_TEXT = "Nothing is compressible right now, so no background compression was queued.";
+export const ASYNC_NUDGE_HINT = "Background compression is on: compress({ content: [] }) queues a separate pass that picks the ranges and writes the summaries while you continue. You can still compress ranges yourself as usual.";
+export const ASYNC_SYSTEM_HINT = "BACKGROUND COMPRESSION\n\ncompress({ content: [] }) queues a background pass that picks the ranges and writes the summaries while you continue; its result is applied at a later request. Use it when a context notice asks you to compress. compress with ranges works as usual.";
+export const asyncSyncGuidance = (why: string): string => `Background compression is not available ${why}. Compress ranges yourself: compress({ content: [{ startId, endId, summary }] }).`;
 const RESPONSES_APIS: ReadonlySet<string> = new Set(["openai-responses", "openai-codex-responses"]);
 
 const SERVER_STATE_KEYS = ["previous_response_id", "conversation", "context_management"];
@@ -69,6 +78,7 @@ interface Job {
   controller: AbortController;
   timer?: ReturnType<typeof setTimeout>;
   ranges?: AsyncRange[];
+  triggerCallId: string;
   bridgeFork?: Promise<unknown>;
   bridgeDeclined?: string;
 }
@@ -132,6 +142,30 @@ export function unsupportedPayloadReason(api: string, payload: unknown): string 
   const list = RESPONSES_APIS.has(api) ? payload.input : payload.messages;
   if (!Array.isArray(list) || list.length === 0) return "payload-shape";
   return null;
+}
+
+// The trigger's result must belong to the payload's final tool-result batch:
+// nothing the assistant produced may follow it.
+export function finalBatchHasResult(api: string, payload: unknown, toolCallId: string): boolean {
+  if (!isRecord(payload)) return false;
+  const ids = new Set([toolCallId, toolCallId.split("|")[0]!]);
+  const assistantItem = (item: Record<string, unknown>) => item.role === "assistant" || item.type === "function_call" || item.type === "reasoning";
+  if (RESPONSES_APIS.has(api)) {
+    const input = Array.isArray(payload.input) ? payload.input.filter(isRecord) : [];
+    const call = input.findIndex((i) => i.type === "function_call" && ids.has(String(i.call_id)));
+    const result = input.findIndex((i) => i.type === "function_call_output" && ids.has(String(i.call_id)));
+    return call >= 0 && result > call && !input.slice(result + 1).some(assistantItem);
+  }
+  const messages = Array.isArray(payload.messages) ? payload.messages.filter(isRecord) : [];
+  const holdsCall = (m: Record<string, unknown>) =>
+    m.role === "assistant" && ((Array.isArray(m.content) && m.content.some((b) => isRecord(b) && b.type === "tool_use" && ids.has(String(b.id))))
+      || (Array.isArray(m.tool_calls) && m.tool_calls.some((c) => isRecord(c) && ids.has(String(c.id)))));
+  const holdsResult = (m: Record<string, unknown>) =>
+    (m.role === "tool" && ids.has(String(m.tool_call_id)))
+    || (m.role === "user" && Array.isArray(m.content) && m.content.some((b) => isRecord(b) && b.type === "tool_result" && ids.has(String(b.tool_use_id))));
+  const call = messages.findIndex(holdsCall);
+  const result = messages.findIndex(holdsResult);
+  return call >= 0 && result > call && !messages.slice(result + 1).some(assistantItem);
 }
 
 export function forkPayload(api: string, payload: unknown, nudgeText: string): unknown {
@@ -227,10 +261,13 @@ export interface AsyncCompressDeps {
 
 export class AsyncCompressor {
   private readonly jobs = new Map<string, Job>();
+  private readonly triggers = new Map<string, string>();
+  private readonly retryReasons = new Map<string, string>();
   private readonly syncRetry = new Set<string>();
   private readonly fallback = new Map<string, string>();
   private readonly notified = new Set<string>();
   private readonly bridgeDeclines = new Map<string, number>();
+  private readonly epochs = new Map<string, number>();
   private readonly timeoutMs: number;
 
   constructor(private readonly deps: AsyncCompressDeps) {
@@ -238,7 +275,39 @@ export class AsyncCompressor {
   }
 
   isActive(sid: string): boolean {
-    return this.jobs.has(sid);
+    return this.jobs.has(sid) || this.triggers.has(sid);
+  }
+
+  /** Changes whenever the session's queued work is cancelled or reset. */
+  epoch(sid: string): number {
+    return this.epochs.get(sid) ?? 0;
+  }
+
+  /** Records the main agent's compress({content: []}); the next request starts the job. */
+  trigger(sid: string, toolCallId: string): void {
+    this.triggers.set(sid, toolCallId);
+    logInfo("async-compress", { sid, event: "triggered", toolCallId });
+  }
+
+  takeTrigger(sid: string): string | undefined {
+    const id = this.triggers.get(sid);
+    this.triggers.delete(sid);
+    return id;
+  }
+
+  dropTrigger(sid: string, reason: string): void {
+    const id = this.takeTrigger(sid);
+    if (id === undefined) return;
+    this.syncRetry.add(sid);
+    this.retryReasons.set(sid, reason);
+    logInfo("async-compress", { sid, event: "trigger-dropped", toolCallId: id, reason });
+  }
+
+  /** Why the last job handed its nudge back to the sync path, read once. */
+  takeRetryReason(sid: string): string | undefined {
+    const reason = this.retryReasons.get(sid);
+    this.retryReasons.delete(sid);
+    return reason;
   }
 
   jobApi(sid: string): string | undefined {
@@ -249,8 +318,9 @@ export class AsyncCompressor {
     return this.fallback.get(sid);
   }
 
-  requestSyncRetry(sid: string): void {
+  requestSyncRetry(sid: string, reason?: string): void {
     this.syncRetry.add(sid);
+    if (reason !== undefined) this.retryReasons.set(sid, reason);
   }
 
   takeSyncRetry(sid: string): boolean {
@@ -261,7 +331,7 @@ export class AsyncCompressor {
     return this.jobs.get(sid)?.phase;
   }
 
-  start(sid: string, init: { nudgeText: string; snapshot: ViewSnapshot; model: NonNullable<ExtensionContext["model"]> }): string {
+  start(sid: string, init: { nudgeText: string; snapshot: ViewSnapshot; model: NonNullable<ExtensionContext["model"]>; triggerCallId: string }): string {
     this.cancel(sid, "superseded");
     const id = randomUUID();
     this.jobs.set(sid, {
@@ -270,6 +340,7 @@ export class AsyncCompressor {
       phase: "awaiting-request",
       nudgeText: init.nudgeText,
       snapshot: init.snapshot,
+      triggerCallId: init.triggerCallId,
       api: String(init.model.api),
       provider: String(init.model.provider),
       model: { ...init.model },
@@ -293,6 +364,10 @@ export class AsyncCompressor {
     if (reason !== null) {
       this.abandon(job, `capture:${reason}`, true);
       this.markFallback(sid, reason, ctx);
+      return;
+    }
+    if (!finalBatchHasResult(job.api, payload, job.triggerCallId)) {
+      this.abandon(job, "capture:trigger-missing", true);
       return;
     }
     job.payload = payload;
@@ -330,8 +405,9 @@ export class AsyncCompressor {
       this.deps.pi.events.emit(BRIDGE_FORK_CHANNEL, {
         version: 1,
         piSessionId: job.sid,
-        prompt: `${BRIDGE_FORK_DIRECTIVE}\n\n${job.nudgeText}`,
+        prompt: `${ASYNC_FORK_DIRECTIVE}\n\n${job.nudgeText}`,
         captureTool: "compress",
+        cutAfterToolResult: job.triggerCallId,
         signal: job.controller.signal,
         // Returns whether this acceptance was taken, so a later acceptor can skip the work.
         accept: (result: unknown): boolean => {
@@ -358,27 +434,36 @@ export class AsyncCompressor {
   }
 
   onMainFailed(sid: string, reason: string, aborted = false): void {
+    this.dropTrigger(sid, reason);
     const job = this.jobs.get(sid);
     if (!job) return;
     if (job.phase === "awaiting-request" || job.phase === "awaiting-response") {
       this.abandon(job, reason, true);
     } else if (aborted && job.phase === "running") {
-      this.abandon(job, reason, false);
+      this.abandon(job, reason, true);
     }
   }
 
   cancel(sid: string, reason: string): void {
+    this.epochs.set(sid, this.epoch(sid) + 1);
+    const owe = !NO_RETRY_CANCELS.has(reason);
+    if (this.triggers.delete(sid)) {
+      if (owe) this.requestSyncRetry(sid, reason);
+      logInfo("async-compress", { sid, event: "trigger-dropped", reason });
+    }
     const job = this.jobs.get(sid);
     if (!job) return;
-    this.abandon(job, reason, false);
+    this.abandon(job, reason, owe);
   }
 
   resetSession(sid: string): void {
+    // The epoch is kept: a queue awaiting its decision across a reset must still see it changed.
     this.cancel(sid, "session-reset");
     this.syncRetry.delete(sid);
     this.fallback.delete(sid);
     this.notified.delete(sid);
     this.bridgeDeclines.delete(sid);
+    this.retryReasons.delete(sid);
   }
 
   takeReady(sid: string): { id: string; ranges: AsyncRange[]; snapshot: ViewSnapshot } | undefined {
@@ -401,7 +486,10 @@ export class AsyncCompressor {
     if (this.jobs.get(job.sid) === job) this.jobs.delete(job.sid);
     if (job.timer) clearTimeout(job.timer);
     job.controller.abort();
-    if (retrySync) this.syncRetry.add(job.sid);
+    if (retrySync) {
+      this.syncRetry.add(job.sid);
+      this.retryReasons.set(job.sid, reason);
+    }
     logInfo("async-compress", { sid: job.sid, event: "job-dropped", job: job.id, phase: job.phase, reason, syncRetry: retrySync });
   }
 
@@ -432,7 +520,7 @@ export class AsyncCompressor {
       const message = await Promise.race([fork, deadline]);
       if (this.jobs.get(job.sid) !== job) return;
       if (message === "deadline") {
-        this.abandon(job, "fork-timeout", false);
+        this.abandon(job, "fork-timeout", true);
         this.markFallback(job.sid, "fork-timeout", ctx);
         return;
       }
@@ -456,19 +544,19 @@ export class AsyncCompressor {
         return;
       }
       if (message.stopReason === "error" || message.stopReason === "aborted") {
-        // A bridge that declined ran nothing, so the nudge it held back is shown next request.
-        this.abandon(job, `fork-${message.stopReason}`, job.bridgeDeclined !== undefined);
+        this.abandon(job, job.bridgeDeclined !== undefined ? `bridge-declined:${job.bridgeDeclined}` : `fork-${message.stopReason}`, true);
         this.markFallback(job.sid, timedOut ? "fork-timeout" : "fork-error", ctx);
         return;
       }
       const call = message.content.find((c) => c.type === "toolCall" && c.name === "compress");
-      if (!call) {
-        this.abandon(job, "fork-no-compress-call", false);
+      const content = call && isRecord(call.arguments) ? call.arguments.content : undefined;
+      if (!call || (Array.isArray(content) && content.length === 0)) {
+        this.abandon(job, "fork-no-compress-call", true);
         return;
       }
       const ranges = rangesFromToolArgs(call.arguments);
       if (typeof ranges === "string") {
-        this.abandon(job, "fork-invalid-args", false);
+        this.abandon(job, "fork-invalid-args", true);
         this.markFallback(job.sid, "invalid-compress-args", ctx);
         return;
       }
@@ -480,7 +568,7 @@ export class AsyncCompressor {
       if (this.jobs.get(job.sid) !== job) return;
       // Provider error text can echo credentials: log the error class only.
       logWarn("async-compress", { sid: job.sid, event: "fork-threw", job: job.id, errorKind: e instanceof Error ? e.name : typeof e });
-      this.abandon(job, "fork-threw", false);
+      this.abandon(job, "fork-threw", true);
       this.markFallback(job.sid, "fork-error", ctx);
     } finally {
       if (job.timer) clearTimeout(job.timer);
@@ -492,7 +580,7 @@ export class AsyncCompressor {
     if (!provider) throw new Error("unknown provider");
     const auth = await ctx.modelRegistry.getProviderAuth(job.provider);
     if (job.controller.signal.aborted) throw new Error("cancelled before transport");
-    const payload = forkPayload(job.api, job.payload, job.nudgeText);
+    const payload = forkPayload(job.api, job.payload, `${ASYNC_FORK_DIRECTIVE}\n\n${job.nudgeText}`);
     const options: StreamOptions = {
       apiKey: auth?.auth.apiKey,
       env: auth?.env,
@@ -576,7 +664,7 @@ export async function applyReadyAsyncResult(input: {
   if (!outcome.ok) {
     logInfo("async-compress", { sid, event: "result-discarded", job: ready.id, kind: outcome.kind, reason: outcome.reason });
     if (outcome.kind === "invalid") compressor.markFallback(sid, "invalid-result", ctx);
-    if (outcome.kind === "refold") compressor.requestSyncRetry(sid);
+    compressor.requestSyncRetry(sid, `result-${outcome.kind}`);
     return undefined;
   }
   const label = outcome.newBlocks.map((b) => blockSpanLabel(b, outcome.state)).join(", ");
@@ -587,6 +675,7 @@ export async function applyReadyAsyncResult(input: {
   } catch (e) {
     logWarn("async-compress", { sid, event: "record-append-failed", job: ready.id, error: e instanceof Error ? e.message : String(e) });
     compressor.markFallback(sid, "record-append-failed", ctx);
+    compressor.requestSyncRetry(sid, "record-append-failed");
     return undefined;
   }
   await input.save(outcome.state);

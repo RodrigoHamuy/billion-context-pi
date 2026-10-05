@@ -349,6 +349,7 @@ export function coreOutToAgentMessages(
   coreOut: CoreMessage[],
   originalById: Map<string, AgentMessage>,
   summaryCarriers?: ReadonlyMap<string, { label: string; timestamp: number }>,
+  ids?: string[],
 ): AgentMessage[] {
   const out: AgentMessage[] = [];
   const emittedSplit = new Set<string>();
@@ -368,6 +369,7 @@ export function coreOutToAgentMessages(
           content: [{ type: "text", text: `${core.text}\n\n[ACP async compression: ${carrier.label}]` }],
           timestamp: carrier.timestamp,
         } as AgentMessage);
+        ids?.push(core.id);
       }
       continue;
     }
@@ -375,7 +377,10 @@ export function coreOutToAgentMessages(
     const hashIdx = core.id.indexOf("#");
     if (hashIdx < 0) {
       const original = originalById.get(core.id);
-      if (original) out.push(patchRefTag(original, core));
+      if (original) {
+        out.push(patchRefTag(original, core));
+        ids?.push(core.id);
+      }
       continue;
     }
 
@@ -394,6 +399,7 @@ export function coreOutToAgentMessages(
     );
 
     out.push(reconstructToolCallMessage(original, core, survivingCallIds, kernelTextByCallId));
+    ids?.push(baseId);
   }
 
   return out;

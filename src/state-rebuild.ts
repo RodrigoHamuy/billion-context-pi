@@ -116,6 +116,12 @@ function parseCompressCall(toolCallId: string, arguments_: unknown, entryIndex: 
   return { entryIndex, prefixEnd: entryIndex + 1, toolCallId, ranges };
 }
 
+// compress({content: []}) only queues background compression; nothing to replay.
+const isEmptyCompress = (args: unknown): boolean => {
+  const content = typeof args === "object" && args !== null ? (args as { content?: unknown }).content : undefined;
+  return Array.isArray(content) && content.length === 0;
+};
+
 /**
  * Replay successful compress calls from the session log against `state`
  * (normally a fresh createInitialState()). Failed, errored, no-op and
@@ -148,7 +154,7 @@ export function rebuildStateFromLog(input: {
       if (call.name !== "compress" || !call.id || !succeeded.has(call.id)) continue;
       const parsed = parseCompressCall(call.id, call.arguments, entryIndex);
       if (parsed) calls.push(parsed);
-      else logWarn("state-rebuild", { event: "unparseable-compress-call", toolCallId: call.id });
+      else if (!isEmptyCompress(call.arguments)) logWarn("state-rebuild", { event: "unparseable-compress-call", toolCallId: call.id });
     }
   });
   entries.forEach((entry, entryIndex) => {

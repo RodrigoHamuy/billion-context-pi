@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { AsyncCompressor, forkPayload, takeSnapshot } from "../src/async-compress.js";
+import { AsyncCompressor, ASYNC_FORK_DIRECTIVE, ASYNC_QUEUED_TEXT, forkPayload, takeSnapshot } from "../src/async-compress.js";
 import { createInitialState } from "acp-kernel";
 
 // #614: the fork goes through the host's REAL pi-ai provider adapters. These
@@ -25,10 +25,19 @@ const ARGS = { content: [{ startId: "m00001", endId: "m00002", summary: "greetin
 const ARGS_JSON = JSON.stringify(ARGS);
 
 const USAGE0 = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-const MAIN_MESSAGES = [
+const FORK_PROMPT = `${ASYNC_FORK_DIRECTIVE}\n\n${NUDGE}`;
+const TRIGGER: Record<string, string> = { "anthropic-messages": "toolu_trigger", "openai-completions": "call_trigger", "openai-responses": "call_trigger|fc_trigger" };
+const READ_ID: Record<string, string> = { "anthropic-messages": "toolu_read", "openai-completions": "call_read", "openai-responses": "call_read|fc_read" };
+const toolCall = (id: string, name: string, args: unknown) => ({ type: "toolCall", id, name, arguments: args });
+const toolResult = (id: string, name: string, text: string) => ({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError: false, timestamp: 5 });
+const assistant = (content: unknown[]) => ({ role: "assistant", content, api: "x", provider: "x", model: "x", usage: USAGE0, stopReason: "toolUse", timestamp: 4 });
+// History ending in the main agent's compress({content: []}) and its "queued" result.
+const mainMessages = (api: string) => [
   { role: "user", content: "hello", timestamp: 1 },
   { role: "assistant", content: [{ type: "text", text: "hi there" }], api: "x", provider: "x", model: "x", usage: USAGE0, stopReason: "stop", timestamp: 2 },
   { role: "user", content: "next", timestamp: 3 },
+  assistant([toolCall(TRIGGER[api]!, "compress", { content: [] })]),
+  toolResult(TRIGGER[api]!, "compress", ASYNC_QUEUED_TEXT),
 ];
 const TOOLS = [{ name: "compress", description: "Compress ranges", parameters: { type: "object", properties: {} } }];
 
@@ -133,13 +142,13 @@ for (const c of CASES) {
     const provider = await loadProvider(c.file, c.factory);
     const model = provider.getModels().find((m) => m.api === c.api)!;
     assert.ok(model, `provider ships a ${c.api} model`);
-    const mainPayload = await buildPayload(provider, model, MAIN_MESSAGES, c.apiKey);
+    const mainPayload = await buildPayload(provider, model, mainMessages(c.api), c.apiKey);
     const sid = `adapter-${c.api}-${c.apiKey}`;
     const ctx = fakeCtx(provider, sid, { apiKey: c.apiKey, baseUrl: "https://fork.test/base" });
     const compressor = new AsyncCompressor({ pi: fakePi });
     const { calls, restore } = stubFetch(c.api);
     try {
-      compressor.start(sid, { nudgeText: NUDGE, snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]> });
+      compressor.start(sid, { nudgeText: NUDGE, snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]>, triggerCallId: TRIGGER[c.api]! });
       const finalHeaders: Record<string, string | null> = { "x-provider-auth": "auth-header" };
       compressor.onHeaders(sid, finalHeaders);
       // A later extension mutates the header object in place AFTER our handler.
@@ -155,7 +164,7 @@ for (const c of CASES) {
       const sent = calls[0]!;
       assert.ok(sent.url.startsWith("https://fork.test/base"), `auth baseUrl honored: ${sent.url}`);
       assert.ok(sent.url.endsWith(c.path), `adapter endpoint: ${sent.url}`);
-      assert.deepEqual(sent.body, JSON.parse(JSON.stringify(forkPayload(c.api, mainPayload, NUDGE))), "wire body is the captured main body plus one appended nudge turn");
+      assert.deepEqual(sent.body, JSON.parse(JSON.stringify(forkPayload(c.api, mainPayload, FORK_PROMPT))), "wire body is the captured main body (ending in the queued result) plus one appended directive + nudge turn");
       assert.equal(sent.headers.get("x-provider-auth"), "auth-header");
       assert.equal(sent.headers.get("x-late-extension"), "late", "in-place header mutations by later handlers are included");
       const auth = sent.headers.get("authorization") ?? sent.headers.get("x-api-key") ?? "";
@@ -189,9 +198,9 @@ for (const c of CASES) {
   test(`real ${c.api} adapter: fork body corresponds to the sync request modulo tail-derived fields`, async () => {
     const provider = await loadProvider(c.file, c.factory);
     const model = provider.getModels().find((m) => m.api === c.api)!;
-    const main = await buildPayload(provider, model, MAIN_MESSAGES, c.apiKey);
-    const sync = await buildPayload(provider, model, [...MAIN_MESSAGES, { role: "user", content: [{ type: "text", text: NUDGE }], timestamp: 4 }], c.apiKey);
-    const fork = forkPayload(c.api, main, NUDGE) as Record<string, unknown>;
+    const main = await buildPayload(provider, model, mainMessages(c.api), c.apiKey);
+    const sync = await buildPayload(provider, model, [...mainMessages(c.api), { role: "user", content: [{ type: "text", text: FORK_PROMPT }], timestamp: 6 }], c.apiKey);
+    const fork = forkPayload(c.api, main, FORK_PROMPT) as Record<string, unknown>;
     assert.deepEqual(normalize(c.api, fork), normalize(c.api, sync));
     const key = c.api === "openai-responses" ? "input" : "messages";
     assert.deepEqual((fork[key] as unknown[]).slice(0, -1), main[key], "fork prefix is byte-identical to the main request");
@@ -205,15 +214,18 @@ test("real anthropic-messages adapter: signed thinking blocks reach the fork byt
     { role: "user", content: "plan it", timestamp: 1 },
     { role: "assistant", content: [{ type: "thinking", thinking: "private plan", thinkingSignature: "SIG-abc123" }, { type: "text", text: "done" }], api: "anthropic-messages", provider: model.provider, model: model.id, usage: USAGE0, stopReason: "stop", timestamp: 2 },
     { role: "user", content: "next", timestamp: 3 },
+    { ...assistant([{ type: "thinking", thinking: "queue it", thinkingSignature: "SIG-def456" }, toolCall("toolu_trigger", "compress", { content: [] })]), api: "anthropic-messages", provider: model.provider, model: model.id },
+    toolResult("toolu_trigger", "compress", ASYNC_QUEUED_TEXT),
   ];
   const main = await buildPayload(provider, model, signed);
   assert.match(JSON.stringify(main), /"signature":"SIG-abc123"/, "adapter replays the signed thinking block");
+  assert.match(JSON.stringify(main), /"signature":"SIG-def456"/, "and the trigger turn's signed thinking");
   const sid = "adapter-signed";
   const ctx = fakeCtx(provider, sid, { apiKey: "sk-ant-api03-test" });
   const compressor = new AsyncCompressor({ pi: fakePi });
   const { calls, restore } = stubFetch("anthropic-messages");
   try {
-    compressor.start(sid, { nudgeText: NUDGE, snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]> });
+    compressor.start(sid, { nudgeText: NUDGE, snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]>, triggerCallId: "toolu_trigger" });
     compressor.onPayload(sid, main, ctx);
     compressor.onResponse(sid, 200, ctx);
     await waitFor(() => compressor.phase(sid) !== "running");
@@ -223,3 +235,34 @@ test("real anthropic-messages adapter: signed thinking blocks reach the fork byt
     restore();
   }
 });
+
+// The trigger's result must be in the payload's final tool-result batch; it
+// need not be the last item (parallel calls), and nothing is rewritten.
+for (const c of CASES) {
+  if (c.apiKey.includes("oat")) continue;
+  test(`real ${c.api} adapter: capture accepts the trigger anywhere in the final tool-result batch and rejects a missing or stale one`, async () => {
+    const provider = await loadProvider(c.file, c.factory);
+    const model = provider.getModels().find((m) => m.api === c.api)!;
+    const trigger = TRIGGER[c.api]!;
+    const read = READ_ID[c.api]!;
+    const head = mainMessages(c.api).slice(0, 3);
+    const parallel = [...head, assistant([toolCall(trigger, "compress", { content: [] }), toolCall(read, "read", { path: "a" })]), toolResult(trigger, "compress", ASYNC_QUEUED_TEXT), toolResult(read, "read", "file text")];
+    const later = [...mainMessages(c.api), assistant([toolCall(read, "read", { path: "a" })]), toolResult(read, "read", "file text")];
+    const missing = [...head, assistant([toolCall(read, "read", { path: "a" })]), toolResult(read, "read", "file text")];
+    const capture = async (messages: unknown[], name: string) => {
+      const payload = await buildPayload(provider, model, messages, c.apiKey);
+      const frozen = JSON.stringify(payload);
+      const sid = `adapter-batch-${c.api}-${name}`;
+      const compressor = new AsyncCompressor({ pi: fakePi });
+      compressor.start(sid, { nudgeText: NUDGE, snapshot: takeSnapshot([], createInitialState()), model: model as unknown as NonNullable<ExtensionContext["model"]>, triggerCallId: trigger });
+      compressor.onPayload(sid, payload, fakeCtx(provider, sid, { apiKey: c.apiKey }));
+      assert.equal(JSON.stringify(payload), frozen, "the main payload is never rewritten");
+      const result = { phase: compressor.phase(sid), retry: compressor.takeSyncRetry(sid) };
+      compressor.resetSession(sid);
+      return result;
+    };
+    assert.deepEqual(await capture(parallel, "parallel"), { phase: "awaiting-response", retry: false }, "trigger result followed by a sibling result is captured");
+    assert.deepEqual(await capture(later, "later"), { phase: undefined, retry: true }, "a newer assistant turn after the trigger means it is not this request's batch");
+    assert.deepEqual(await capture(missing, "missing"), { phase: undefined, retry: true }, "no trigger result: nothing forks, the nudge goes back to the sync path");
+  });
+}

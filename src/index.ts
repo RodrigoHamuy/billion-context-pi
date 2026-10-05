@@ -12,7 +12,7 @@ import type { CoreMessage, NudgeDecision, CompressionBlock, Prompts } from "acp-
 import { renderNudgeText, resolvePrompts, defaultPrompts, viableRanges } from "acp-kernel";
 import { type AdapterConfig, resolveCompress, resolveDelegate, resolveHostSession, DEFAULT_DELEGATE_POLICY } from "./config.js";
 import { createRuntime, isPiHost, retryBreakerKey, type AcpRuntime } from "./runtime.js";
-import { makeCompressTool, isCompressSuccessText, isCompressNoopText } from "./compress-tool.js";
+import { makeCompressTool, isCompressSuccessText, isCompressNoopText, type AsyncCompressGate } from "./compress-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
@@ -23,8 +23,9 @@ import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
 import { coreOutToAgentMessages, extractText, ACP_NUDGE_CUSTOM_TYPE, ASYNC_COMPRESS_CUSTOM_TYPE, type AcpNudgeRecord } from "./messages.js";
-import { AsyncCompressor, ASYNC_SUPPORTED_APIS, applyReadyAsyncResult, asyncCarriers, asyncEnabledValue, isBridgeForkApi, takeSnapshot } from "./async-compress.js";
+import { AsyncCompressor, ASYNC_ALREADY_QUEUED_TEXT, ASYNC_NOTHING_TEXT, ASYNC_NUDGE_HINT, ASYNC_QUEUED_TEXT, ASYNC_SUPPORTED_APIS, ASYNC_SYSTEM_HINT, applyReadyAsyncResult, asyncCarriers, asyncEnabledValue, asyncSyncGuidance, isBridgeForkApi, takeSnapshot } from "./async-compress.js";
 import { liveOnlyTailCached, dropLiveOnlyTailCache } from "./live-only-tail.js";
+import { RetainedNudges, retainsNudges } from "./retained-nudges.js";
 import { carryHostSystemMessages } from "./system-passthrough.js";
 import { sanitizeToolPairing } from "./tool-pair-sanitizer.js";
 import { countThinkingChars, dropCompressReasoning } from "./reasoning-drop.js";
@@ -122,14 +123,16 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     wireDelegateReadTracking(pi);
     wireSessionLifecycle(pi, runtime, standDownIfProxied);
     wireAsyncCompress(pi, runtime, asyncCompress);
-    wireContextTransform(pi, runtime, standDownIfProxied, asyncCompress);
+    const retainedNudges = new RetainedNudges<AgentMessage>();
+    wireRetainedNudges(pi, retainedNudges);
+    wireContextTransform(pi, runtime, standDownIfProxied, asyncCompress, retainedNudges);
     wireBeforeProviderRequest(pi, runtime, standDownIfProxied, asyncCompress);
-    wireSystemPrompt(pi, runtime);
+    wireSystemPrompt(pi, runtime, asyncCompress);
     wireToolGuardrails(pi, runtime);
     wireOverflowSelfHeal(pi, runtime);
     wireThrottleRetry(pi, runtime);
     const toolSurface = readToolSurfaceWithPacks(process.cwd());
-    pi.registerTool(makeCompressTool(runtime, toolSurface.compress));
+    pi.registerTool(makeCompressTool(runtime, toolSurface.compress, asyncCompressGate(runtime, asyncCompress, retainedNudges)));
     pi.registerTool(makeDecompressTool(runtime, toolSurface.decompress));
     pi.registerTool(makeSearchTool(runtime, toolSurface.search_context));
     pi.registerTool(makeStatusTool(runtime, toolSurface.acp_status));
@@ -473,6 +476,44 @@ function asyncConfigured(runtime: AcpRuntime, ctx: ExtensionContext, api: unknow
   return bridge;
 }
 
+// Same checks as asyncCompressEligible, without recording a fallback.
+function asyncCompressAvailable(runtime: AcpRuntime, asyncCompress: AsyncCompressor, ctx: ExtensionContext): boolean {
+  const sid = ctx.sessionManager?.getSessionId?.();
+  return !!sid && asyncConfigured(runtime, ctx) && asyncCompress.fallbackReason(sid) === undefined && isPiHost(ctx.sessionManager)
+    && !!ctx.model && typeof ctx.modelRegistry?.getProvider === "function" && ASYNC_SUPPORTED_APIS.has(String(ctx.model.api));
+}
+
+const modelKey = (ctx: ExtensionContext): string => `${String(ctx.model?.provider)}/${String(ctx.model?.id)}/${String(ctx.model?.api)}`;
+
+function asyncCompressGate(runtime: AcpRuntime, asyncCompress: AsyncCompressor, retainedNudges: RetainedNudges<AgentMessage>): AsyncCompressGate {
+  return {
+    async queue(ctx, toolCallId, nudge, signal) {
+      if (runtime.refused || !asyncConfigured(runtime, ctx)) return undefined;
+      const sid = ctx.sessionManager.getSessionId();
+      if (!asyncCompressEligible(runtime, asyncCompress, ctx, sid)) return asyncSyncGuidance(`in this session (${asyncCompress.fallbackReason(sid) ?? "unsupported"})`);
+      const epoch = asyncCompress.epoch(sid);
+      const model = modelKey(ctx);
+      const decision = await nudge();
+      // A cancel, session change, model change or abort while the decision was computed: queue nothing.
+      if (signal?.aborted || ctx.sessionManager.getSessionId() !== sid || asyncCompress.epoch(sid) !== epoch || modelKey(ctx) !== model || !asyncCompressEligible(runtime, asyncCompress, ctx, sid)) {
+        return asyncSyncGuidance("right now (the session changed while queueing)");
+      }
+      if (decision?.breakdown?.emergencyOverride === 1) return asyncSyncGuidance("while the context is nearly full");
+      if (asyncCompress.isActive(sid)) return ASYNC_ALREADY_QUEUED_TEXT;
+      if (!decision || viableRanges(decision.compressibleRanges).length === 0) return ASYNC_NOTHING_TEXT;
+      asyncCompress.trigger(sid, toolCallId);
+      return ASYNC_QUEUED_TEXT;
+    },
+    folded(ctx) {
+      asyncCompress.cancel(ctx.sessionManager.getSessionId(), "superseded-by-sync-compress");
+    },
+    // Retained nudges go out with every request, as in the context transform's estimate.
+    extraTokens(ctx) {
+      return retainsNudges(ctx.model?.api) ? retainedNudges.tokens(ctx.sessionManager.getSessionId()) : 0;
+    },
+  };
+}
+
 function asyncCompressEligible(runtime: AcpRuntime, asyncCompress: AsyncCompressor, ctx: ExtensionContext, sid: string): boolean {
   const m = ctx.model as { api?: string } | undefined;
   if (!asyncConfigured(runtime, ctx) || asyncCompress.fallbackReason(sid) !== undefined) return false;
@@ -490,7 +531,18 @@ function asyncCompressEligible(runtime: AcpRuntime, asyncCompress: AsyncCompress
 // The core integration: Pi's `context` event fires before every LLM call with the
 // messages about to be sent. We run acp-kernel's processTurn (prune + ref-tag +
 // nudge decision) and return the transformed AgentMessage[].
-function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean, asyncCompress: AsyncCompressor): void {
+function wireRetainedNudges(pi: ExtensionAPI, retained: RetainedNudges<AgentMessage>): void {
+  const reset = (_event: unknown, ctx: ExtensionContext) => { retained.reset(ctx.sessionManager.getSessionId()); };
+  pi.on("session_start", reset);
+  pi.on("session_before_switch", reset);
+  pi.on("session_before_fork", reset);
+  pi.on("session_before_tree", reset);
+  pi.on("session_before_compact", reset);
+  pi.on("model_select", reset);
+  pi.on("session_shutdown", reset);
+}
+
+function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean, asyncCompress: AsyncCompressor, retainedNudges: RetainedNudges<AgentMessage>): void {
   pi.on("context", async (event, ctx) => {
     // Refused host (OMP / proxied baseUrl): leave the context completely
     // untouched — no ref tags, no compression, no nudge. Returning undefined
@@ -547,7 +599,12 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       const systemPromptText = getSystemPromptText(ctx);
       const systemPromptTokens = systemPromptText ? defaultCountTokens(systemPromptText) : 0;
       const imageTokens = collectImageTokens(entries, modelSupportsImages(ctx.model));
-      const sentTokens = estimateTokens(coreMessages, coveredIds, imageTokens) + systemPromptTokens;
+      const retainOn = retainsNudges(ctx.model?.api);
+      if (!retainOn) retainedNudges.reset(sid);
+      // Retained nudges go out with every request (see retained-nudges.ts): count them like the system prompt.
+      const retainedTokens = retainOn ? retainedNudges.prune(sid, new Set(coreMessages.filter((m) => !coveredIds.has(m.id)).map((m) => m.id))) : 0;
+      const fixedTokens = systemPromptTokens + retainedTokens;
+      const sentTokens = estimateTokens(coreMessages, coveredIds, imageTokens) + fixedTokens;
       // Self-heal (armed): after an overflow, force this turn's usage to >=95%
       // so the kernel's emergency nudge + tool-result truncate fire immediately,
       // even if the estimate under-reports the sent view. Consumed exactly once.
@@ -645,7 +702,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
             logInfo("turn", { sid, event: "view-recount", source: "prev-turn", prelim: sentTokens, viewTokens: meter.viewTokens, tokenCount });
           }
         } else {
-          const view = sentViewTokenCount(runtime.core, coreMessages, state, config, tokenCount, imageTokens, systemPromptTokens);
+          const view = sentViewTokenCount(runtime.core, coreMessages, state, config, tokenCount, imageTokens, fixedTokens);
           if (view.drifted) {
             tokenCount = applyFloors(view.viewTokens);
             guardTokens = guardBasis(view.viewTokens);
@@ -717,7 +774,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // processTurn above stay on the resync-only path. Unusable when this turn
       // ran in the truncate band (output may be post-truncation → under-reports).
       const truncateBand = config.modelContextLimit > 0 ? Math.floor(config.truncate.threshold * config.modelContextLimit) : Number.MAX_SAFE_INTEGER;
-      const sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens;
+      const sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + fixedTokens;
       runtime.noteSentViewCount(sid, {
         viewTokens: sentViewTokens,
         blocksLen: turn.state.blocks.length,
@@ -797,7 +854,8 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     });
 
     const originalById = collectOriginals(entries);
-    let rebuilt = coreOutToAgentMessages(turn.messages, originalById, asyncCarriers(turn.state));
+    const rebuiltIds: string[] = [];
+    let rebuilt = coreOutToAgentMessages(turn.messages, originalById, asyncCarriers(turn.state), rebuiltIds);
     // [#336] Request-time reasoning drop, aligned with opencode-acp #377:
     // compress calls are hard-exempt from compression, so their thinking
     // rides along every request as an unreclaimable floor. Round closure is
@@ -838,6 +896,8 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       logWarn("degeneration", { sid, event: "runs-collapsed", msgs: deg.evidence.length, maxRun, minRun: degCfg.minRun });
       debug.event("degeneration-collapsed", { sid, msgs: deg.evidence.length, maxRun });
     }
+    const nudgeAnchorId = rebuiltIds.at(-1);
+    if (retainOn) rebuilt = retainedNudges.replay(sid, rebuilt, rebuiltIds);
     if (tailRuns) {
       rebuilt.push(degenerationNotice(tailRuns));
       const top = [...tailRuns].sort((a, b) => b.count - a.count)[0]!;
@@ -900,7 +960,22 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       runtime.markNudgeShown(sid, turnKey, tokenCount);
     }
 
-    let asyncHandoff: { message: AgentMessage; text: string } | null = null;
+    // The main agent queued background compression with compress({content: []}):
+    // the fork starts from this request, which carries the "queued" result.
+    const triggerCallId = asyncCompress.takeTrigger(sid);
+    if (triggerCallId !== undefined) {
+      const ranges = turn.nudge ? viableRanges(turn.nudge.compressibleRanges) : [];
+      const inView = coreMessages.some((m) => m.toolCallId === triggerCallId && m.role !== "assistant");
+      const emergencyNow = turn.nudge?.breakdown?.emergencyOverride === 1;
+      if (turn.nudge && ranges.length > 0 && inView && !emergencyNow && ctx.model && asyncCompressEligible(runtime, asyncCompress, ctx, sid)) {
+        const forkNudge = nudgeMessage({ ...turn.nudge, compressibleRanges: ranges }, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx));
+        asyncCompress.start(sid, { nudgeText: extractText((forkNudge as { content?: unknown }).content), snapshot: takeSnapshot(coreMessages, turn.state), model: ctx.model, triggerCallId });
+      } else {
+        const reason = !inView ? "trigger-not-in-view" : emergencyNow ? "emergency" : ranges.length === 0 ? "nothing-compressible" : "async-unavailable";
+        asyncCompress.requestSyncRetry(sid, reason);
+        logInfo("async-compress", { sid, event: "trigger-dropped", toolCallId: triggerCallId, reason });
+      }
+    }
     // A nudge held back for a fork that ran nothing is owed now, though the
     // kernel's cadence already counted it as shown.
     const owedRetry = !!turn.nudge && !turn.nudge.shouldInject && viableRanges(turn.nudge.compressibleRanges).length > 0 && asyncCompress.takeSyncRetry(sid);
@@ -942,12 +1017,22 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       const retryCapped = runtime.compressRetryCappedFor(sid, retryTurnKey);
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
       const syncRetry = owedRetry || (!emergency && asyncCompress.takeSyncRetry(sid));
+      const retryReason = syncRetry ? asyncCompress.takeRetryReason(sid) : undefined;
       const asyncOn = !emergency && !syncRetry && asyncCompressEligible(runtime, asyncCompress, ctx, sid);
       const alreadyShown = retryCapped || (asyncOn && asyncCompress.isActive(sid)) || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady && !syncRetry);
       if (!alreadyShown) {
-        const injected = nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx));
+        const injected = nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx), {
+          lead: retryReason !== undefined ? `Background compression did not run (${retryReason}); compress the ranges yourself.` : undefined,
+          tail: asyncOn ? ASYNC_NUDGE_HINT : undefined,
+        });
+        // A new nudge at a retained one's anchor replaces it (a real input change).
+        const replaced = retainOn && nudgeAnchorId !== undefined ? retainedNudges.at(sid, nudgeAnchorId) : undefined;
+        if (replaced) rebuilt = rebuilt.filter((m) => m !== replaced);
         rebuilt.push(injected);
-        if (asyncOn) asyncHandoff = { message: injected, text: extractText((injected as { content?: unknown }).content) };
+        if (retainOn && nudgeAnchorId !== undefined) {
+          if (!emergency) retainedNudges.retain(sid, nudgeAnchorId, injected, defaultCountTokens(extractText((injected as { content?: unknown }).content)));
+          else if (replaced) retainedNudges.drop(sid, nudgeAnchorId);
+        }
         const rendered = renderNudgeText(turn.nudge, runtime.prompts, activeNudgeSections(runtime, ctx));
         const top = [...turn.nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
         const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}", summary: "..." }] })` : "";
@@ -1019,16 +1104,6 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       }
     }
 
-    // The fork appends the nudge last, so hand off only when it is already last.
-    if (asyncHandoff) {
-      if (rebuilt[rebuilt.length - 1] === asyncHandoff.message && ctx.model) {
-        rebuilt = rebuilt.slice(0, -1);
-        asyncCompress.start(sid, { nudgeText: asyncHandoff.text, snapshot: takeSnapshot(coreMessages, turn.state), model: ctx.model });
-      } else {
-        logInfo("async-compress", { sid, event: "handoff-skipped", reason: "nudge-not-final" });
-      }
-    }
-
     // Always return the transformed array: every message needs its [mNNNNN] ref
     // tag applied, so there is no meaningful "no change" case to short-circuit.
     debug.event("context-out", { outMsgs: rebuilt.length, injected: turn.nudge?.shouldInject ?? false, emergency: turn.nudge?.breakdown?.emergencyOverride === 1 });
@@ -1054,7 +1129,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
 
 let lastPackPromptGateKeys: string | null = null;
 
-function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime): void {
+function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime, asyncCompress: AsyncCompressor): void {
   pi.on("before_agent_start", (event, ctx) => {
     // Refused host (OMP): don't inject the ACP system prompt — the model must
     // not learn about compress/decompress on a host where they can't work.
@@ -1085,7 +1160,8 @@ function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime): void {
       runtime.setPrompts(defaultPrompts);
     }
     const delegate = resolveDelegate(runtime.adapter).enabled && !runtime.delegateStoodDown;
-    const acp = buildAcpSystemPrompt(runtime.prompts, merged.promptSections);
+    const base = buildAcpSystemPrompt(runtime.prompts, merged.promptSections);
+    const acp = ctx && asyncCompressAvailable(runtime, asyncCompress, ctx) ? `${base}\n\n${ASYNC_SYSTEM_HINT}` : base;
     const delegateText = merged.delegatePrompt !== undefined ? merged.delegatePrompt : ACP_DELEGATE_PROMPT;
     const prompt = delegate && delegateText !== null ? `${acp}\n${delegateText}` : acp;
     return { systemPrompt: formatSystemPromptForEvent(event.systemPrompt, prompt) };
@@ -1270,9 +1346,9 @@ function collectCompressOutcomes(entries: Array<{ type: string; id: string; mess
   return out;
 }
 
-function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts: Prompts, sections?: NudgeSectionsConfig): AgentMessage {
+function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts: Prompts, sections?: NudgeSectionsConfig, notes: { lead?: string; tail?: string } = {}): AgentMessage {
   const rendered = renderNudgeText(nudge, prompts, sections);
-  const lines = [rendered.text];
+  const lines = notes.lead ? [notes.lead, "", rendered.text] : [rendered.text];
 
   if (blocks.length > 0) {
     const totalSummary = blocks.reduce((s, b) => s + Math.ceil((b.summary || "").length / 4), 0);
@@ -1289,6 +1365,7 @@ function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts:
     lines.push("");
     lines.push(`Compressed blocks: ${blocks.length} active (${tierStr}) — ${fmt(totalSummary)} summary, ${fmt(totalCompressed)} original compressed. Blocks: ${ids}${extra}.`);
   }
+  if (notes.tail) lines.push("", notes.tail);
 
   return {
     role: "user",

@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +6,8 @@ import { basename, join } from "node:path";
 import { createAcpExtension } from "../src/index.js";
 import { setRunNpmForTest } from "../src/update.js";
 import { ASYNC_CALL_ID_PREFIX, ASYNC_COMPRESS_CUSTOM_TYPE, ACP_NUDGE_CUSTOM_TYPE } from "../src/messages.js";
+import { ASYNC_ALREADY_QUEUED_TEXT, ASYNC_FORK_DIRECTIVE, ASYNC_NOTHING_TEXT, ASYNC_NUDGE_HINT, ASYNC_QUEUED_TEXT, ASYNC_SYSTEM_HINT } from "../src/async-compress.js";
+import { usageAnchorPredatesCompression } from "../src/floor-stale.js";
 
 setRunNpmForTest(async (args) => ({ code: 0, stdout: args[0] === "view" ? "0.0.1\n" : "", stderr: "" }));
 process.env.ACP_UPDATE_THROTTLE_FILE = join(tmpdir(), `acp-test-async-compress-throttle-${process.pid}`);
@@ -21,6 +23,8 @@ interface Harness {
   forkCalls: Array<{ model: unknown; context: unknown; options: Record<string, unknown> }>;
   appendThrows: boolean;
   forkReply: () => unknown;
+  tools: Map<string, { execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<{ content: Array<{ text: string }> }> }>;
+  lastTrigger?: string;
 }
 
 const MID = "lorem ipsum dolor sit amet ".repeat(400);
@@ -65,6 +69,7 @@ async function harness(name: string, adapter: Record<string, unknown> = { compre
   h.appended = [];
   h.forkCalls = [];
   h.appendThrows = false;
+  h.tools = new Map();
   h.forkReply = () => ({
     role: "assistant",
     content: [{ type: "toolCall", id: "t1", name: "compress", arguments: { content: [{ startId: "m00002", endId: "m00010", summary: "early turns: repeated lorem ipsum exchanges between user and assistant, no decisions", topic: "early" }] } }],
@@ -79,7 +84,7 @@ async function harness(name: string, adapter: Record<string, unknown> = { compre
   };
   const api = {
     on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
-    registerTool() {},
+    registerTool(tool: { name: string }) { h.tools.set(tool.name, tool as never); },
     registerCommand() {},
     registerEntryRenderer() {},
     appendEntry(customType: string, data?: unknown) {
@@ -107,7 +112,41 @@ function hasNudge(result: unknown): boolean {
   return msgs.some((m) => m.role === "user" && /compress/i.test(JSON.stringify(m.content)) && /Compression|compress\(/.test(JSON.stringify(m.content)));
 }
 
-const MAIN_PAYLOAD = { model: "test-model", messages: [{ role: "user", content: "history" }], system: [{ type: "text", text: "SYS" }] };
+const USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+
+// The request after compress({content: []}): history, the call, its "queued" result.
+function triggerPayload(id: string) {
+  return { model: "test-model", system: [{ type: "text", text: "SYS" }], messages: [
+    { role: "user", content: "history" },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "compress", input: { content: [] } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "queued" }] },
+  ] };
+}
+
+let triggerSeq = 0;
+
+async function runCompress(h: Harness, id: string, params: unknown): Promise<string> {
+  const result = await h.tools.get("compress")!.execute(id, params, undefined, undefined, h.ctx);
+  return result.content[0]!.text;
+}
+
+// The main agent calls compress({content: []}); pi records the call and its result.
+async function queue(h: Harness): Promise<{ id: string; text: string }> {
+  const id = `trig${++triggerSeq}`;
+  const text = await runCompress(h, id, { content: [] });
+  h.entries = [...h.entries,
+    { type: "message", id: `a-${id}`, parentId: null, timestamp: "", message: { role: "assistant", content: [{ type: "toolCall", id, name: "compress", arguments: { content: [] } }], api: "anthropic-messages", provider: "anthropic", model: "test-model", usage: USAGE, stopReason: "toolUse", timestamp: 1 } },
+    { type: "message", id: `r-${id}`, parentId: null, timestamp: "", message: { role: "toolResult", toolCallId: id, toolName: "compress", content: [{ type: "text", text }], isError: false, timestamp: 1 } }];
+  h.lastTrigger = id;
+  return { id, text };
+}
+
+// Queue, then the next request's context event starts the job.
+async function startJob(h: Harness): Promise<unknown> {
+  const q = await queue(h);
+  assert.equal(q.text, ASYNC_QUEUED_TEXT);
+  return h.emit("context", { messages: [] });
+}
 
 function grow(h: Harness, n = 20): void {
   const start = h.entries.length;
@@ -132,7 +171,7 @@ const flush = () => new Promise((r) => setTimeout(r, 20));
 
 async function sendMainRequest(h: Harness, status = 200): Promise<void> {
   await h.emit("before_provider_headers", { headers: { "x-session": "abc" } });
-  await h.emit("before_provider_request", { payload: MAIN_PAYLOAD });
+  await h.emit("before_provider_request", { payload: triggerPayload(h.lastTrigger ?? "none") });
   await h.emit("after_provider_response", { status, headers: {} });
   await flush();
 }
@@ -141,35 +180,55 @@ test("default off: nudge stays in context, no fork, no async record (byte-identi
   const h = await harness("off", {});
   const r = await h.emit("context", { messages: [] });
   assert.match(lastText(r), /efficiency nudge/);
+  assert.ok(!lastText(r).includes("Background compression"), "no async hint");
+  assert.equal(await runCompress(h, "off-empty", { content: [] }), "No ranges provided.", "empty compress keeps its sync reply");
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 0);
   assert.deepEqual(h.appended.map((a) => a.customType), [ACP_NUDGE_CUSTOM_TYPE]);
 });
 
-test("async on: nudge is withheld from main, fork gets main payload + exact sync nudge, result applied at next request boundary with carrier", async () => {
-  const sync = await harness("sync-ref", {});
-  const syncResult = await sync.emit("context", { messages: [] });
-  const syncMsgs = messagesOf(syncResult);
-  const syncNudge = syncMsgs[syncMsgs.length - 1]!.content as Array<{ text: string }>;
+// Live o2-live-1: Sonnet over claude-bridge sent content as the JSON string "[]" (the schema's string form).
+test("JSON-encoded empty content is the same empty call: sync reply when off, queued when on; malformed JSON still errors", async () => {
+  const off = await harness("json-empty-off", {});
+  await off.emit("context", { messages: [] });
+  assert.equal(await runCompress(off, "off-json", { content: "[]" }), "No ranges provided.");
+  assert.equal(await runCompress(off, "off-json2", { content: JSON.stringify("[ ]") }), "No ranges provided.", "double-encoded");
+  await assert.rejects(runCompress(off, "off-bad", { content: "[" }), /Invalid compress content/);
+  const on = await harness("json-empty-on");
+  await on.emit("context", { messages: [] });
+  assert.equal(await runCompress(on, "on-json", { content: "[]" }), ASYNC_QUEUED_TEXT);
+});
 
+test("async on: main sees the nudge, compress([]) queues, the fork replays the request carrying the queued result + directive + nudge, result applied at next request boundary with carrier", async () => {
   const h = await harness("apply");
   const r1 = await h.emit("context", { messages: [] });
-  assert.doesNotMatch(lastText(r1), /efficiency nudge/, "main request goes out without the nudge");
-  assert.equal(messagesOf(r1).length, syncMsgs.length - 1, "main view = sync view minus the final nudge");
-  assert.deepEqual(h.appended.map((a) => a.customType), [ACP_NUDGE_CUSTOM_TYPE], "nudge record still persisted");
+  assert.match(lastText(r1), /efficiency nudge/, "main sees the nudge");
+  assert.ok(lastText(r1).includes(ASYNC_NUDGE_HINT.slice(0, 40)), "with the async hint");
+  await sendMainRequest(h);
+  assert.equal(h.forkCalls.length, 0, "nothing forks until main asks");
+
+  const q = await queue(h);
+  assert.equal(q.text, ASYNC_QUEUED_TEXT, "compress([]) returns at once");
+  const rq = await h.emit("context", { messages: [] });
+  assert.doesNotMatch(lastText(rq), /efficiency nudge/, "no nudge while the job is queued");
+  assert.equal(await runCompress(h, "again", { content: [] }), ASYNC_ALREADY_QUEUED_TEXT, "a second trigger joins the queued job");
 
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 1, "fork launched once after the main response arrived");
   const call = h.forkCalls[0]!;
   const forkBody = (call.options.onPayload as () => { messages: unknown[] })();
-  assert.deepEqual(forkBody.messages.slice(0, -1), MAIN_PAYLOAD.messages, "fork prefix = captured main payload");
-  assert.deepEqual(forkBody.messages[forkBody.messages.length - 1], { role: "user", content: [{ type: "text", text: syncNudge[0]!.text }] }, "appended turn = exact sync nudge text");
+  assert.deepEqual(forkBody.messages.slice(0, -1), triggerPayload(q.id).messages, "fork prefix = captured main payload, queued result included");
+  const prompt = (forkBody.messages[forkBody.messages.length - 1] as { role: string; content: Array<{ text: string }> });
+  assert.equal(prompt.role, "user");
+  assert.ok(prompt.content[0]!.text.startsWith(`${ASYNC_FORK_DIRECTIVE}\n\n`), "directive first");
+  assert.match(prompt.content[0]!.text, /efficiency nudge/, "then the nudge");
+  assert.ok(!prompt.content[0]!.text.includes(ASYNC_NUDGE_HINT), "the fork is not told to queue again");
   assert.deepEqual(call.options.headers, { "x-session": "abc" });
   assert.equal(call.options.sessionId, "async-apply");
   assert.ok(!("reasoning" in call.options), "thinking off → no reasoning option");
   assert.deepEqual((call.context as { tools: Array<{ name: string }> }).tools.map((t) => t.name), ["compress"]);
 
-  const before = messagesOf(r1).length;
+  const before = messagesOf(rq).length;
   const r2 = await h.emit("context", { messages: [] });
   const record = h.appended.find((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE);
   assert.ok(record, "durable replay record appended");
@@ -194,7 +253,7 @@ test("async on: nudge is withheld from main, fork gets main payload + exact sync
 
 test("job in flight suppresses further non-emergency nudges (no duplicate compression)", async () => {
   const h = await harness("inflight");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   h.entries = [...h.entries, roleMsg("x1", "user", "more " + MID)];
   const r2 = await h.emit("context", { messages: [] });
   assert.doesNotMatch(lastText(r2), /efficiency nudge/);
@@ -204,7 +263,7 @@ test("job in flight suppresses further non-emergency nudges (no duplicate compre
 
 test("record append failure discards the result: no block without its durable replay record, live state untouched", async () => {
   const h = await harness("append-fail");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   h.appendThrows = true;
   const r2 = await h.emit("context", { messages: [] });
@@ -216,12 +275,13 @@ test("record append failure discards the result: no block without its durable re
 
 test("stale result (history prefix changed) is discarded, nothing applied", async () => {
   const h = await harness("stale");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
-  // Branch navigation: the history from e3 on is replaced by a different branch.
+  // Branch navigation: the history from e3 on, queued call included, is a different branch.
   h.entries = h.entries.map((e) => {
     const id = (e as { id?: string }).id ?? "";
-    return /^e\d+$/.test(id) && Number(id.slice(1)) >= 3 ? roleMsg(`${id}-b`, Number(id.slice(1)) % 2 ? "assistant" : "user", "branch " + MID) : e;
+    if (/^e\d+$/.test(id)) return Number(id.slice(1)) >= 3 ? roleMsg(`${id}-b`, Number(id.slice(1)) % 2 ? "assistant" : "user", "branch " + MID) : e;
+    return id === "u0" ? e : { ...(e as object), id: `${id}-b` };
   });
   const r2 = await h.emit("context", { messages: [] });
   assert.ok(!h.appended.some((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE));
@@ -230,12 +290,14 @@ test("stale result (history prefix changed) is discarded, nothing applied", asyn
 
 test("main request failing before launch drops the job and hands the nudge back to the sync path", async () => {
   const h = await harness("main-fail");
-  await h.emit("context", { messages: [] });
-  await h.emit("before_provider_request", { payload: MAIN_PAYLOAD });
+  await startJob(h);
+  await h.emit("before_provider_request", { payload: triggerPayload(h.lastTrigger!) });
   await h.emit("message_end", { message: { role: "assistant", stopReason: "error", content: [], errorMessage: "boom" } });
   grow(h);
   const r2 = await h.emit("context", { messages: [] });
   assert.ok(endsWithNudge(r2), "next nudge goes out synchronously");
+  assert.match(lastText(r2), /Background compression did not run \(main-error\)/, "and says why");
+  assert.ok(!lastText(r2).includes(ASYNC_NUDGE_HINT.slice(0, 40)), "without offering the queue again");
   await h.emit("after_provider_response", { status: 200, headers: {} });
   await flush();
   assert.equal(h.forkCalls.length, 0);
@@ -243,7 +305,7 @@ test("main request failing before launch drops the job and hands the nudge back 
 
 test("non-2xx main response drops the job before launch", async () => {
   const h = await harness("main-429");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h, 429);
   assert.equal(h.forkCalls.length, 0);
   grow(h);
@@ -262,7 +324,7 @@ test("session switch aborts an in-flight fork and its result is never applied", 
     h.forkCalls.push({ model: _m, context: _c, options: o });
     return { result: async () => { await gate; return h.forkReply(); } };
   };
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   assert.equal(signal?.aborted, false);
   await h.emit("session_before_switch", { reason: "new" });
@@ -278,6 +340,8 @@ test("emergency nudges stay synchronous even with compress.async", async () => {
   h.entries = baseEntries(80);
   const r = await h.emit("context", { messages: [] });
   assert.match(lastText(r), /Context limit reached|EMERGENCY|context/i);
+  assert.ok(!lastText(r).includes(ASYNC_NUDGE_HINT.slice(0, 40)), "no async hint in an emergency");
+  assert.match(await runCompress(h, "emergency-empty", { content: [] }), /not available while the context is nearly full/, "and no queue");
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 0);
 });
@@ -285,9 +349,10 @@ test("emergency nudges stay synchronous even with compress.async", async () => {
 test("Codex stream-start launch: assistant message_start launches once; user/error/aborted starts do not", async () => {
   const h = await harness("stream-start");
   (h.ctx.model as { api: string }).api = "openai-codex-responses";
-  await h.emit("context", { messages: [] });
+  await startJob(h);
+  const id = h.lastTrigger!;
   await h.emit("before_provider_headers", { headers: { "x-session": "abc" } });
-  await h.emit("before_provider_request", { payload: { model: "test-model", store: false, input: [{ role: "user", content: "history" }] } });
+  await h.emit("before_provider_request", { payload: { model: "test-model", store: false, input: [{ role: "user", content: "history" }, { type: "function_call", call_id: id, name: "compress", arguments: "{\"content\":[]}" }, { type: "function_call_output", call_id: id, output: "queued" }] } });
   await h.emit("message_start", { message: { role: "user", content: "hi", timestamp: 1 } });
   await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "error", timestamp: 1 } });
   await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "aborted", timestamp: 1 } });
@@ -302,9 +367,9 @@ test("Codex stream-start launch: assistant message_start launches once; user/err
 
 test("non-Codex wires launch only from after_provider_response, never from message_start", async () => {
   const h = await harness("http-then-start");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await h.emit("before_provider_headers", { headers: { "x-session": "abc" } });
-  await h.emit("before_provider_request", { payload: MAIN_PAYLOAD });
+  await h.emit("before_provider_request", { payload: triggerPayload(h.lastTrigger!) });
   await h.emit("message_start", { message: { role: "assistant", content: [], stopReason: "stop", timestamp: 1 } });
   await flush();
   assert.equal(h.forkCalls.length, 0);
@@ -318,14 +383,16 @@ test("unsupported api falls back to sync nudges", async () => {
   (h.ctx.model as { api: string }).api = "google-generative-ai";
   const r = await h.emit("context", { messages: [] });
   assert.match(lastText(r), /efficiency nudge/);
+  assert.ok(!lastText(r).includes(ASYNC_NUDGE_HINT.slice(0, 40)), "no async hint on an unsupported wire");
+  assert.match(await runCompress(h, "unsupported-empty", { content: [] }), /not available in this session \(unsupported-api:google-generative-ai\)/);
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 0);
 });
 
 test("unsupported payload shape at capture falls back to sync without a network call", async () => {
   const h = await harness("bad-payload");
-  await h.emit("context", { messages: [] });
-  await h.emit("before_provider_request", { payload: { ...MAIN_PAYLOAD, previous_response_id: "resp_1" } });
+  await startJob(h);
+  await h.emit("before_provider_request", { payload: { ...triggerPayload(h.lastTrigger!), previous_response_id: "resp_1" } });
   await h.emit("after_provider_response", { status: 200, headers: {} });
   await flush();
   assert.equal(h.forkCalls.length, 0);
@@ -336,7 +403,7 @@ test("unsupported payload shape at capture falls back to sync without a network 
 test("fork without a compress call applies nothing; invalid ranges are rejected all-or-nothing", async () => {
   const h = await harness("no-call");
   h.forkReply = () => ({ role: "assistant", content: [{ type: "text", text: "nothing to do" }], stopReason: "stop" });
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   await h.emit("context", { messages: [] });
   assert.ok(!h.appended.some((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE));
@@ -350,7 +417,7 @@ test("fork without a compress call applies nothing; invalid ranges are rejected 
     ] } }],
     stopReason: "toolUse",
   });
-  await g.emit("context", { messages: [] });
+  await startJob(g);
   await sendMainRequest(g);
   const r = await g.emit("context", { messages: [] });
   assert.ok(!g.appended.some((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE), "partial batch never applied");
@@ -359,7 +426,7 @@ test("fork without a compress call applies nothing; invalid ranges are rejected 
 
 test("restart without sidecar: async block is rebuilt from the durable record and the carrier re-renders identically", async () => {
   const h = await harness("replay");
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   const r2 = await h.emit("context", { messages: [] });
   const carrier = messagesOf(r2).filter((m) => JSON.stringify(m.content).includes("[ACP async compression:"));
@@ -427,7 +494,7 @@ function gatedProvider(h: Harness): { signal: () => AbortSignal | undefined; rel
 test("compaction proceeding (refused-host path) aborts an in-flight fork", async () => {
   const h = await harness("compact-cancel");
   const g = gatedProvider(h);
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   assert.equal(g.signal()?.aborted, false);
   for (const fn of h.handlers.get("session_before_compact") ?? []) await fn({ type: "session_before_compact" }, h.ctx);
@@ -441,7 +508,7 @@ test("compaction proceeding (refused-host path) aborts an in-flight fork", async
 test("user abort of the main request after launch cancels the fork; a plain main error after launch does not", async () => {
   const h = await harness("abort-after-launch");
   const g = gatedProvider(h);
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   await h.emit("message_end", { message: { role: "assistant", stopReason: "aborted", content: [] } });
   assert.equal(g.signal()?.aborted, true, "Esc on the main request aborts the fork");
@@ -449,7 +516,7 @@ test("user abort of the main request after launch cancels the fork; a plain main
 
   const e = await harness("error-after-launch");
   const ge = gatedProvider(e);
-  await e.emit("context", { messages: [] });
+  await startJob(e);
   await sendMainRequest(e);
   await e.emit("message_end", { message: { role: "assistant", stopReason: "error", content: [], errorMessage: "stream reset" } });
   assert.equal(ge.signal()?.aborted, false, "a transient main error leaves the fork running");
@@ -466,8 +533,8 @@ test("turning compress.async off while a result is pending discards it", async (
   await writeFile(join(cwd, ".pi", "acp.json"), JSON.stringify({ compress: { async: true } }));
   const h = await harness("opt-out", {});
   (h.ctx as { cwd: string }).cwd = cwd;
-  const r1 = await h.emit("context", { messages: [] });
-  assert.ok(!endsWithNudge(r1), "async handoff via project acp.json");
+  assert.match(lastText(await h.emit("context", { messages: [] })), /efficiency nudge/, "config read from the project acp.json");
+  await startJob(h);
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 1);
   await writeFile(join(cwd, ".pi", "acp.json"), JSON.stringify({ compress: { async: false } }));
@@ -484,7 +551,7 @@ test("record written but sidecar save lost with an EXISTING non-empty sidecar: r
   const h = await harness("recover-1");
   h.ctx.sessionManager.getSessionFile = () => stateFile;
   // First async cycle lands normally → sidecar on disk has b1.
-  await h.emit("context", { messages: [] });
+  await startJob(h);
   await sendMainRequest(h);
   await h.emit("context", { messages: [] });
   const sidecar1 = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8")) as { blocks: Array<{ compressCallId?: string }> };
@@ -498,13 +565,7 @@ test("record written but sidecar save lost with an EXISTING non-empty sidecar: r
     content: [{ type: "toolCall", id: "t2", name: "compress", arguments: { content: [{ startId: "m00012", endId: "m00020", summary: "middle turns: more repeated lorem ipsum exchanges, still nothing decided", topic: "middle" }] } }],
     stopReason: "toolUse",
   });
-  const nudgeRecords = () => h.appended.filter((a) => a.customType === ACP_NUDGE_CUSTOM_TYPE).length;
-  const before = nudgeRecords();
-  for (let i = 0; i < 3 && nudgeRecords() === before; i++) {
-    const r = await h.emit("context", { messages: [] });
-    assert.ok(!endsWithNudge(r), "nudge withheld (async handoff), never sync");
-  }
-  assert.equal(nudgeRecords(), before + 1, "second nudge decided");
+  await startJob(h);
   await sendMainRequest(h);
   assert.equal(h.forkCalls.length, 2, "second fork launched");
   const tmpPath = join(dir, `.acp-tmp-${basename(stateFile)}.acp.json`);
@@ -539,4 +600,156 @@ test("malformed async records in the session log do not break context handling",
     .map((data, i) => ({ type: "custom", id: `m${i}`, parentId: null, timestamp: "", customType: ASYNC_COMPRESS_CUSTOM_TYPE, data }))];
   const r = await h.emit("context", { messages: [] });
   assert.ok(messagesOf(r).length > 0);
+});
+
+test("compress([]) with nothing viable to compress is not queued", async () => {
+  const h = await harness("nothing", { compress: { async: true } });
+  h.entries = baseEntries(2);
+  await h.emit("context", { messages: [] });
+  assert.equal(await runCompress(h, "nothing-empty", { content: [] }), ASYNC_NOTHING_TEXT);
+  await h.emit("context", { messages: [] });
+  await sendMainRequest(h);
+  assert.equal(h.forkCalls.length, 0);
+});
+
+test("a successful sync compress cancels a queued job; an invalid one leaves it running", async () => {
+  const h = await harness("sync-cancels");
+  await h.emit("context", { messages: [] });
+  await queue(h);
+  await assert.rejects(runCompress(h, "bad-sync", { content: "not json" }), "malformed sync call throws");
+  await h.emit("context", { messages: [] });
+  await sendMainRequest(h);
+  assert.equal(h.forkCalls.length, 1, "the queued job survived the malformed call");
+
+  const g = await harness("sync-cancels-2");
+  await g.emit("context", { messages: [] });
+  await queue(g);
+  const folded = await runCompress(g, "good-sync", { content: [{ startId: "m00002", endId: "m00010", summary: "early turns: repeated lorem ipsum exchanges, no decisions" }] });
+  assert.match(folded, /^▣ ACP \|/, "sync fold succeeded");
+  await g.emit("context", { messages: [] });
+  await sendMainRequest(g);
+  assert.equal(g.forkCalls.length, 0, "the queued job was cancelled: its snapshot predates the fold");
+});
+
+test("the queued result is never a compression landmark, replay source or block, live or after restart", async () => {
+  const h = await harness("queued-landmark");
+  await h.emit("context", { messages: [] });
+  await queue(h);
+  assert.equal(usageAnchorPredatesCompression(h.entries as never), false, "floor-stale ignores the queued result");
+  await h.emit("session_shutdown", {});
+
+  const stateFile = join(tmpdir(), `pai-acp-async-queued-restart-${process.pid}.session.json`);
+  await rm(`${stateFile}.acp.json`, { force: true });
+  const fresh = await harness("queued-restart");
+  fresh.entries = h.entries;
+  fresh.ctx.sessionManager.getSessionFile = () => stateFile;
+  const r = await fresh.emit("context", { messages: [] });
+  assert.ok(!JSON.stringify(messagesOf(r)).includes("[ACP async compression:"), "nothing replayed as applied");
+  assert.match(lastText(r), /efficiency nudge/, "the nudge is not suppressed by a pending job or a false landmark");
+  await sendMainRequest(fresh);
+  assert.equal(fresh.forkCalls.length, 0, "a trigger from before the restart never forks");
+  await rm(`${stateFile}.acp.json`, { force: true });
+});
+
+test("a fork that makes no compress call, or a main run ending before the next request, owes main a sync nudge with the reason", async () => {
+  const h = await harness("owed-no-call");
+  h.forkReply = () => ({ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "compress", arguments: { content: [] } }], stopReason: "toolUse" });
+  await startJob(h);
+  await sendMainRequest(h);
+  grow(h, 2);
+  const r = await h.emit("context", { messages: [] });
+  assert.match(lastText(r), /Background compression did not run \(fork-no-compress-call\)/);
+  assert.ok(!lastText(r).includes(ASYNC_NUDGE_HINT.slice(0, 40)), "the owed nudge is synchronous");
+
+  const g = await harness("owed-agent-end");
+  await g.emit("context", { messages: [] });
+  await queue(g);
+  await g.emit("agent_end", { messages: [] });
+  grow(g, 2);
+  const r2 = await g.emit("context", { messages: [] });
+  assert.match(lastText(r2), /Background compression did not run \(agent-end-before-launch\)/);
+  await sendMainRequest(g);
+  assert.equal(g.forkCalls.length, 0);
+});
+
+test("the system prompt explains the trigger only while async compression is available", async () => {
+  const prompt = async (h: Harness) => ((await h.emit("before_agent_start", { systemPrompt: "BASE", prompt: "hi" })) as { systemPrompt?: string } | undefined)?.systemPrompt ?? "";
+  assert.ok((await prompt(await harness("sys-on"))).includes(ASYNC_SYSTEM_HINT));
+  assert.ok(!(await prompt(await harness("sys-off", {}))).includes("BACKGROUND COMPRESSION"));
+  const u = await harness("sys-unsupported");
+  (u.ctx.model as { api: string }).api = "google-generative-ai";
+  assert.ok(!(await prompt(u)).includes("BACKGROUND COMPRESSION"));
+});
+
+test("a fork that times out, throws or returns invalid ranges owes main one sync nudge with the reason, through the real hooks", async () => {
+  const owed = async (name: string, reply: () => unknown, reason: RegExp, driveTimeout = false) => {
+    const h = await harness(name);
+    h.forkReply = reply;
+    await startJob(h);
+    if (driveTimeout) {
+      mock.timers.enable({ apis: ["setTimeout"] });
+      try {
+        await h.emit("before_provider_headers", { headers: {} });
+        await h.emit("before_provider_request", { payload: triggerPayload(h.lastTrigger!) });
+        await h.emit("after_provider_response", { status: 200, headers: {} });
+        mock.timers.tick(5 * 60_000 + 1);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      } finally {
+        mock.timers.reset();
+      }
+    } else {
+      await sendMainRequest(h);
+    }
+    grow(h, 2);
+    const r = await h.emit("context", { messages: [] });
+    assert.match(lastText(r), reason, `${name}: owed nudge says why`);
+    assert.ok(!h.appended.some((a) => a.customType === ASYNC_COMPRESS_CUSTOM_TYPE), `${name}: nothing applied`);
+    const again = await h.emit("context", { messages: [] });
+    assert.doesNotMatch(lastText(again), /Background compression did not run/, `${name}: owed once`);
+  };
+  await owed("owed-timeout", () => new Promise(() => {}), /Background compression did not run \(fork-timeout\)/, true);
+  await owed("owed-threw", () => { throw new Error("boom"); }, /Background compression did not run \(fork-threw\)/);
+  await owed("owed-invalid-args", () => ({ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "compress", arguments: { content: "garbage" } }], stopReason: "toolUse" }), /Background compression did not run \(fork-invalid-args\)/);
+  await owed("owed-invalid-result", () => ({ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "compress", arguments: { content: [{ startId: "m09000", endId: "m09002", summary: "refs this session never had: rejected at the next request boundary" }] } }], stopReason: "toolUse" }), /Background compression did not run \(result-(invalid|stale)\)/);
+});
+
+test("compress([]) queues nothing when cancelled, aborted or the session changes while its decision is computed", async () => {
+  for (const [name, interrupt] of [
+    ["race-abort", (_h: Harness, c: AbortController) => c.abort()],
+    ["race-switch", (h: Harness) => h.emit("session_before_switch", { reason: "new" })],
+    ["race-model", (h: Harness) => h.emit("model_select", {})],
+    // A reset with no abort signal, same session id and model: only the epoch can tell.
+    // Handlers are started together (their synchronous parts, incl. the reset, run now) so the reset lands while the decision is pending.
+    ["race-reset", (h: Harness) => Promise.all((h.handlers.get("session_start") ?? []).map((fn) => fn({ type: "session_start", reason: "new" }, h.ctx)))],
+  ] as const) {
+    const h = await harness(name);
+    await h.emit("context", { messages: [] });
+    const controller = new AbortController();
+    // The decision reads session state asynchronously; the interrupt lands while it is pending.
+    let decided = false;
+    const pending = h.tools.get("compress")!.execute("race-trig", { content: [] }, controller.signal, undefined, h.ctx).then((r) => r.content[0]!.text, (e: Error) => `threw:${e.message}`);
+    void pending.then(() => { decided = true; });
+    const interrupted = interrupt(h, controller);
+    const settledFirst = decided;
+    await interrupted;
+    assert.equal(settledFirst, false, `${name}: interrupted before the decision settled`);
+    const text = await pending;
+    assert.notEqual(text, ASYNC_QUEUED_TEXT, `${name}: not queued (${text})`);
+    grow(h, 2);
+    const next = lastText(await h.emit("context", { messages: [] }));
+    assert.doesNotMatch(next, /Background compression did not run/, `${name}: no orphan trigger was recorded`);
+    await sendMainRequest(h);
+    assert.equal(h.forkCalls.length, 0, `${name}: no orphan job`);
+  }
+  const control = await harness("race-control");
+  await control.emit("context", { messages: [] });
+  assert.equal(await runCompress(control, "race-control-trig", { content: [] }), ASYNC_QUEUED_TEXT, "uninterrupted, the same call queues");
+});
+
+test("compress([]) in an emergency gets sync guidance even while a job is active", async () => {
+  const h = await harness("emergency-active");
+  await h.emit("context", { messages: [] });
+  await startJob(h);
+  h.entries = [...h.entries, ...baseEntries(60).slice(1)];
+  assert.match(await runCompress(h, "emergency-again", { content: [] }), /not available while the context is nearly full/);
 });

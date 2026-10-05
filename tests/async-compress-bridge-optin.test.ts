@@ -60,12 +60,13 @@ async function session(sid: string, compress: unknown, opts: { api?: string; onF
     opts.onFork?.(r);
   });
   const handlers = new Map<string, Handler[]>();
+  const tools = new Map<string, { execute: (...a: unknown[]) => Promise<{ content: Array<{ text: string }> }> }>();
   const appended: Array<{ customType: string; data?: unknown }> = [];
   let entries: unknown[] = [entry("u0", "user", "start " + MID, api)];
   for (let i = 1; i < 40; i++) entries.push(entry(`e${i}`, i % 2 ? "assistant" : "user", `turn ${i} ` + MID, api));
   const pi = {
     on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
-    registerTool() {},
+    registerTool(tool: never) { tools.set((tool as { name: string }).name, tool); },
     registerCommand() {},
     registerEntryRenderer() {},
     appendEntry(customType: string, data?: unknown) {
@@ -95,17 +96,25 @@ async function session(sid: string, compress: unknown, opts: { api?: string; onF
     return last;
   };
   const lastText = (r: unknown) => JSON.stringify((r as { messages: unknown[] }).messages.at(-1));
-  /** One main turn: context until a nudge is decided, then the assistant stream starts. */
+  const syncNudged = (r: unknown) => lastText(r).includes("Compression Philosophy");
+  let seq = 0;
+  /** One main turn: context until a nudge is shown; main calls compress({content: []});
+   *  the next request (carrying the result) is built and its stream starts. */
   const turn = async () => {
     let r: unknown;
     for (let i = 0; i < 3; i++) {
       r = await emit("context", { messages: [] });
-      if (logLines(sid, "job-created").length || /compress/i.test(lastText(r)) && !/lorem ipsum/.test(lastText(r))) break;
+      if (syncNudged(r)) break;
     }
+    const id = `toolu_${sid}_${++seq}`;
+    const queued = (await tools.get("compress")!.execute(id, { content: [] }, undefined, undefined, ctx)).content[0]!.text;
+    entries = [...entries,
+      { type: "message", id: `a-${id}`, parentId: null, timestamp: "", message: { role: "assistant", content: [{ type: "toolCall", id, name: "compress", arguments: { content: [] } }], api, provider: api, model: "m", usage: USAGE0, stopReason: "toolUse", timestamp: 1 } },
+      { type: "message", id: `r-${id}`, parentId: null, timestamp: "", message: { role: "toolResult", toolCallId: id, toolName: "compress", content: [{ type: "text", text: queued }], isError: false, timestamp: 1 } }];
+    await emit("context", { messages: [] });
     await emit("message_start", { message: { role: "assistant", content: [], stopReason: "stop", api, provider: api, model: "m", usage: USAGE0, timestamp: Date.now() } });
-    return r;
+    return { nudge: r, queued };
   };
-  const syncNudged = (r: unknown) => /compress/i.test(lastText(r)) && !/lorem ipsum/.test(lastText(r));
   open.push(async () => {
     await emit("session_shutdown", {});
     await rm(cwd, { recursive: true, force: true });
@@ -119,8 +128,10 @@ const READY = { ok: true, args: { content: [{ startId: "m00002", endId: "m00010"
 test("claude-bridge async is off by default and with compress.async alone: sync nudge, no fork request, no fallback", async () => {
   for (const [sid, compress] of [["optin-default", undefined], ["optin-async-only", { async: true }], ["optin-flag-only", { asyncClaudeBridge: true }]] as const) {
     const s = await session(sid, compress, { onFork: (r) => r.accept(Promise.resolve(READY)) });
-    const r = await s.turn();
-    assert.ok(s.syncNudged(r), `${sid}: nudge stays in the main request`);
+    const { nudge, queued } = await s.turn();
+    assert.ok(s.syncNudged(nudge), `${sid}: nudge in the main request`);
+    assert.ok(!JSON.stringify(nudge).includes("Background compression is on"), `${sid}: without the async hint`);
+    assert.equal(queued, "No ranges provided.", `${sid}: compress([]) keeps its sync reply`);
     assert.equal(s.requests.length, 0, `${sid}: no isolated-fork request`);
     assert.equal(logLines(sid, "job-created").length, 0, `${sid}: no async job`);
     assert.equal(logLines(sid, "sync-fallback").length + logLines(sid, "job-dropped").length, 0, `${sid}: not treated as a bridge failure`);
@@ -140,8 +151,9 @@ test("compress.async alone logs the missing claude-bridge opt-in once per sessio
 test("compress.async plus compress.asyncClaudeBridge forks through the bridge", async () => {
   const sid = "optin-both";
   const s = await session(sid, { async: true, asyncClaudeBridge: true }, { onFork: (r) => r.accept(Promise.resolve(READY)) });
-  const r = await s.turn();
-  assert.ok(!s.syncNudged(r), "nudge handed to the fork");
+  const { nudge, queued } = await s.turn();
+  assert.ok(JSON.stringify(nudge).includes("Background compression is on"), "main sees the nudge and the async hint");
+  assert.match(queued, /^Background compression queued/);
   assert.equal(s.requests.length, 1);
   await waitFor(() => logLines(sid, "result-ready").length > 0);
   await s.emit("context", { messages: [] });
@@ -169,8 +181,8 @@ test("asyncClaudeBridge resolves through the providers/models cascade; only a li
 test("other async routes ignore asyncClaudeBridge", async () => {
   const sid = "optin-anthropic";
   const s = await session(sid, { async: true }, { api: "anthropic-messages" });
-  const r = await s.turn();
-  assert.ok(!s.syncNudged(r), "anthropic-messages still hands off with compress.async alone");
+  const { queued } = await s.turn();
+  assert.match(queued, /^Background compression queued/, "anthropic-messages queues with compress.async alone");
   assert.equal(logLines(sid, "job-created").length, 1);
   assert.equal(logLines(sid, "bridge-async-not-enabled").length, 0);
 });
@@ -211,15 +223,18 @@ test("a ready bridge result is gated by the job's API, not the model switched to
   assert.equal(logLines(sid, "result-discarded").length, 0, "dropped by the opt-out, not by validation");
 });
 
-test("a nudge held back for a declined bridge fork is shown on the next request, though the kernel's cadence already counted it", async () => {
+test("after a declined bridge fork the nudge is shown synchronously on the next request, with the reason", async () => {
   const sid = "optin-declined-retry";
   const s = await session(sid, { async: true, asyncClaudeBridge: true }, { onFork: (r) => r.accept(Promise.resolve({ ok: false, reason: "stale-context" })) });
-  const r = await s.turn();
-  assert.ok(!s.syncNudged(r), "nudge handed to the fork");
+  await s.turn();
   assert.equal(s.requests.length, 1);
   await waitFor(() => logLines(sid, "job-dropped").length > 0);
-  assert.ok(s.syncNudged(await s.emit("context", { messages: [] })), "the held-back nudge is shown synchronously");
-  assert.ok(!s.syncNudged(await s.emit("context", { messages: [] })), "and only once");
+  const retry = await s.emit("context", { messages: [] });
+  assert.ok(s.syncNudged(retry), "the nudge main asked to queue is shown synchronously");
+  assert.match(JSON.stringify(retry), /Background compression did not run \(bridge-declined:stale-context\)/);
+  // claude-bridge keeps that nudge in later requests unchanged instead of injecting another.
+  const again = await s.emit("context", { messages: [] }) as { messages: unknown[] };
+  assert.deepEqual(again.messages, (retry as { messages: unknown[] }).messages, "the same nudge, kept, not a second one");
   assert.equal(s.requests.length, 1, "the retry does not start another fork");
   assert.equal(logLines(sid, "sync-fallback").length, 0, "one decline keeps async on");
 });
