@@ -85,7 +85,8 @@ interface Job {
 
 interface ForkMessage {
   stopReason: string;
-  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** `complete` is set only by the claude-bridge fork; false means the totals are unconfirmed and output may understate. */
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; complete?: boolean };
   content: ReadonlyArray<{ type: string; name?: string; arguments?: unknown }>;
 }
 
@@ -535,6 +536,7 @@ export class AsyncCompressor {
         output: usage?.output ?? null,
         cacheRead: usage?.cacheRead ?? null,
         cacheWrite: usage?.cacheWrite ?? null,
+        usageComplete: usage?.complete ?? null,
       });
       if (job.bridgeDeclined !== undefined && BRIDGE_TRANSIENT_DECLINES.has(job.bridgeDeclined)) {
         this.abandon(job, `bridge-declined:${job.bridgeDeclined}`, true);
@@ -606,7 +608,13 @@ export class AsyncCompressor {
 }
 
 function isUsage(v: unknown): v is NonNullable<ForkMessage["usage"]> {
-  return isRecord(v) && ["input", "output", "cacheRead", "cacheWrite"].every((k) => typeof v[k] === "number");
+  return isRecord(v) && ["input", "output", "cacheRead", "cacheWrite"].every((k) => typeof v[k] === "number" && Number.isFinite(v[k]) && v[k] >= 0);
+}
+
+function bridgeUsage(v: unknown): ForkMessage["usage"] {
+  if (!isUsage(v)) return undefined;
+  const { input, output, cacheRead, cacheWrite, complete } = v;
+  return { input, output, cacheRead, cacheWrite, ...(typeof complete === "boolean" ? { complete } : {}) };
 }
 
 function bridgeFailureReason(result: unknown): string {
@@ -617,7 +625,7 @@ function bridgeFailureReason(result: unknown): string {
 /** Maps the bridge's fork result onto the shape a provider fork returns; anything malformed is an error. */
 export function bridgeForkMessage(result: unknown): ForkMessage {
   if (!isRecord(result) || typeof result.ok !== "boolean") return { stopReason: "error", content: [] };
-  const usage = isUsage(result.usage) ? result.usage : undefined;
+  const usage = bridgeUsage(result.usage);
   if (result.ok) {
     if (!isRecord(result.args)) return { stopReason: "error", content: [] };
     return { stopReason: "toolUse", ...(usage ? { usage } : {}), content: [{ type: "toolCall", name: "compress", arguments: result.args }] };

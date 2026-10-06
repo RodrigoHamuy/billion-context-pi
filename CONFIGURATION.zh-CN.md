@@ -715,7 +715,7 @@
 
   **限制：**
   - fork 复用的是 **ACP 的 `before_provider_request` 处理器所看到的** provider 载荷。Pi 允许后加载的扩展*替换*该载荷，而这种替换对扩展不可见；存在此类扩展时，fork 读到的字节可能与主请求不同（缓存未命中，摘要可能涉及主 agent 未看到的内容）。后续 `before_provider_headers` 处理器原地修改的请求头*会*被包含。校验证明的是历史结构与 ref，而不是摘要忠实于 ACP 从未见过的字节。
-  - fork 的用量写入 ACP 日志（`event=fork-finished`，含 input / output / cacheRead / cacheWrite），但**不**计入 Pi 的会话费用统计。
+  - fork 的用量写入 ACP 日志（`event=fork-finished`，含 input / output / cacheRead / cacheWrite），但**不**计入 Pi 的会话费用统计。claude-bridge fork 的 `usageComplete` 为 `false` 时，表示 bridge 未能确认响应的最终计数（output 可能偏低）；bridge 未说明时为 `null`。
   - Anthropic：fork 保留主请求的缓存断点（因此前缀为缓存读取）；同步请求则会把该断点移到 nudge 上。
   - 基于环境变量认证的 provider（Bedrock、Vertex）目前属于不支持的协议，保持同步。
   - Codex（`openai-codex-responses`）：即使主 agent 使用 Codex WebSocket，fork 也始终走 HTTP/SSE，因此绝不共用主 socket 及其 `previous_response_id` 续接状态。fork 发送相同的 `prompt_cache_key` 和会话 id，OAuth token 在 fork 时经 Pi 的 provider 鉴权获取（临近过期会刷新）。主请求仍在流式输出时后端能否让 fork 的前缀命中缓存，尚未验证。

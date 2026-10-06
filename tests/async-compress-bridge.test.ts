@@ -61,6 +61,17 @@ test("bridgeForkMessage: maps the bridge result onto a fork message and treats a
     assert.equal(bridgeForkMessage(bad).stopReason, "error", JSON.stringify(bad));
   }
   assert.equal(bridgeForkMessage({ ok: true, args: ARGS, usage: { input: "1" } }).usage, undefined, "malformed usage is dropped");
+  for (const count of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(bridgeForkMessage({ ok: true, args: ARGS, usage: { ...USAGE, output: count } }).usage, undefined, `output ${count} is dropped`);
+  }
+});
+
+test("bridgeForkMessage: keeps the bridge's completeness flag and nothing else it does not know", () => {
+  assert.deepEqual(bridgeForkMessage({ ok: true, args: ARGS, usage: { ...USAGE, complete: false } }).usage, { ...USAGE, complete: false });
+  assert.deepEqual(bridgeForkMessage({ ok: false, reason: "aborted", usage: { ...USAGE, complete: true } }).usage, { ...USAGE, complete: true });
+  assert.deepEqual(bridgeForkMessage({ ok: true, args: ARGS, usage: USAGE }).usage, USAGE, "an older bridge states no completeness, and none is guessed");
+  assert.deepEqual(bridgeForkMessage({ ok: true, args: ARGS, usage: { ...USAGE, complete: "yes", extra: 1 } }).usage, USAGE);
+  assert.equal("usage" in bridgeForkMessage({ ok: true, args: ARGS }), false, "a result without usage gets none");
 });
 
 test("claude-bridge: no provider capture; launches from stream start with the exact v1 request; result becomes ready", async () => {
