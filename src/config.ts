@@ -183,8 +183,7 @@ export interface CompressSettings {
   /** Opt-in (#614). Default: false. When true, non-emergency nudges are answered
    *  by a same-model fork in the background; emergency nudges stay synchronous. */
   async?: boolean;
-  /** Experimental, default false. claude-bridge async also needs this: its fork
-   *  showed system-prompt-only cache reuse in testing (pi-claude-bridge #161). */
+  /** Additional opt-in for experimental claude-bridge async compression. Default: false. */
   asyncClaudeBridge?: boolean;
 }
 
